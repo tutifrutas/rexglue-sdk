@@ -54,8 +54,9 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/texture_cache.cpp
 )
 
-# D3D12 backend
-if(REXGLUE_USE_D3D12)
+# Shared D3D shader semantics. Vulkan's ROV reconstruction and its offline
+# reference compiler use the exact Windows DXBC generator, without D3D12 APIs.
+if(REXGLUE_USE_D3D12 OR REXGLUE_USE_VULKAN)
     # DXBC third-party dependency
     set(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES
         ${REXGLUE_ROOT}/thirdparty/dxbc/DXBCChecksum.cpp
@@ -71,6 +72,9 @@ if(REXGLUE_USE_D3D12)
         pipeline/shader/dxbc_translator_om.cpp
     )
 
+endif()
+
+if(REXGLUE_USE_D3D12)
     # D3D12 GPU backend
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
@@ -86,14 +90,22 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(REXGLUE_USE_VULKAN)
-    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+    include(${CMAKE_CURRENT_SOURCE_DIR}/vulkan/dxbc_spirv_dependency.cmake)
+    list(APPEND REXGPU_XENOS_SOURCES
+        ${REXGPU_XENOS_SPIRV_SOURCES}
+        ${REXGPU_XENOS_VULKAN_SOURCES}
+        vulkan/rov_runtime_compiler.cpp
+        vulkan/rov_system_constants.cpp
+        vulkan/rov_diagnostics.cpp)
 endif()
 
-if(REXGLUE_USE_D3D12)
+if(REXGLUE_USE_D3D12 OR REXGLUE_USE_VULKAN)
     list(APPEND REXGPU_XENOS_SOURCES
         ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
-        ${REXGPU_XENOS_DXBC_SOURCES}
-        ${REXGPU_XENOS_D3D12_SOURCES})
+        ${REXGPU_XENOS_DXBC_SOURCES})
+endif()
+if(REXGLUE_USE_D3D12)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
@@ -104,6 +116,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
+rexglue_add_version_resource(rexgpu-xenos DESCRIPTION "ReXGlue Xenos GPU emulation")
 
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
@@ -144,6 +157,7 @@ if(REXGLUE_USE_VULKAN)
         glslang::SPIRV
         GPUOpen::VulkanMemoryAllocator
         glslang
+        dxbc_spirv_runtime
         MachineIndependent
         GenericCodeGen
         OSDependent

@@ -62,6 +62,41 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
+REXCVAR_DEFINE_BOOL(d3d12_rov_late_depth, false, "GPU/D3D12",
+                    "Use late depth testing for eligible ROV pixel shaders");
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_sample_count_specialization, true, "GPU/D3D12",
+                    "Compile ROV pixel shaders for the active guest sample count")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_sample_count_1x_specialization, true, "GPU/D3D12",
+                    "Enable the 1x ROV sample-count shader variant")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_sample_count_2x_specialization, true, "GPU/D3D12",
+                    "Enable the 2x ROV sample-count shader variant")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_sample_count_4x_specialization, true, "GPU/D3D12",
+                    "Enable the 4x ROV sample-count shader variant")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_rgba8_pack_specialization, true, "GPU/D3D12",
+                    "Specialize ROV color packing for linear RGBA8 targets")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_no_blend_specialization, true, "GPU/D3D12",
+                    "Omit general blending code for source-only ROV draws")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_depth_profile_specialization, true, "GPU/D3D12",
+                    "Compile ROV shaders for common no-stencil depth states")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_rov_blend_profile_specialization, true, "GPU/D3D12",
+                    "Compile ROV shaders for exact common RGBA8 blend equations")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -592,6 +627,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       } else {
         pixel_shader = nullptr;
         pipeline_runtime_description.pixel_shader = nullptr;
+        pipeline_runtime_description.depth_only_pixel_shader =
+            GetDepthOnlyPixelShader(pipeline_description.pixel_shader_modification);
       }
       GeometryShaderKey pipeline_geometry_shader_key;
       pipeline_runtime_description.geometry_shader =
@@ -614,8 +651,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
                   sizeof(pipeline_description));
 
       Pipeline* new_pipeline = new Pipeline;
-      std::memcpy(&new_pipeline->description, &pipeline_runtime_description,
-                  sizeof(pipeline_runtime_description));
+      new_pipeline->description = pipeline_runtime_description;
       new_pipeline->root_signature.store(pipeline_runtime_description.root_signature,
                                          std::memory_order_release);
       uint32_t bound_rts = 0;
@@ -846,7 +882,7 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModifica
 
 DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+    reg::RB_DEPTHCONTROL normalized_depth_control, const ROVDrawState& rov_draw_state) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -873,6 +909,121 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
     modification.pixel.param_gen_point = 0;
   }
 
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
+    const uint32_t sample_count_log2 = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+    const bool sample_count_variant_enabled =
+        (sample_count_log2 == 0 && REXCVAR_GET(d3d12_rov_sample_count_1x_specialization)) ||
+        (sample_count_log2 == 1 && REXCVAR_GET(d3d12_rov_sample_count_2x_specialization)) ||
+        (sample_count_log2 == 2 && REXCVAR_GET(d3d12_rov_sample_count_4x_specialization));
+    if (REXCVAR_GET(d3d12_rov_sample_count_specialization) && sample_count_variant_enabled) {
+      modification.pixel.rov_sample_count_specialized = 1;
+      modification.pixel.rov_sample_count_log2 = sample_count_log2;
+    }
+    uint32_t written_targets = shader.writes_color_targets();
+    if (REXCVAR_GET(d3d12_rov_rgba8_pack_specialization)) {
+      for (uint32_t rt_index = 0; rt_index < 4; ++rt_index) {
+        if ((written_targets & (1u << rt_index)) &&
+            regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt_index])
+                    .color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+          modification.pixel.rov_rgba8_targets |= 1u << rt_index;
+        }
+      }
+    }
+    uint32_t active_written_targets = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if ((written_targets & (1u << i)) &&
+          ((rov_draw_state.normalized_color_mask >> (i * 4)) & 0xFu)) {
+        active_written_targets |= 1u << i;
+      }
+    }
+    modification.pixel.rov_no_blend = uint32_t(
+        REXCVAR_GET(d3d12_rov_no_blend_specialization) && active_written_targets != 0);
+    for (uint32_t i = 0; i < 4 && modification.pixel.rov_no_blend; ++i) {
+      if ((active_written_targets & (1u << i)) &&
+          (regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF) != 0x00010001) {
+        modification.pixel.rov_no_blend = 0;
+      }
+    }
+
+    modification.pixel.rov_full_write = uint32_t(written_targets != 0);
+    for (uint32_t i = 0; i < 4 && modification.pixel.rov_full_write; ++i) {
+      if (!(written_targets & (1u << i))) {
+        continue;
+      }
+      if (!(active_written_targets & (1u << i))) {
+        modification.pixel.rov_full_write = 0;
+        break;
+      }
+      const uint32_t keep_low = rov_draw_state.rt_keep_masks[i][0];
+      const uint32_t keep_high = rov_draw_state.rt_keep_masks[i][1];
+      if (keep_low || keep_high) {
+        modification.pixel.rov_full_write = 0;
+      }
+    }
+
+    const bool effective_depth_stencil_enabled = rov_draw_state.depth_stencil_enabled;
+    if (REXCVAR_GET(d3d12_rov_depth_profile_specialization)) {
+      if (!effective_depth_stencil_enabled) {
+        modification.pixel.rov_depth_profile = 1;
+      } else if (!normalized_depth_control.stencil_enable && normalized_depth_control.z_enable) {
+        switch (normalized_depth_control.zfunc) {
+          case xenos::CompareFunction::kNever:
+            modification.pixel.rov_depth_profile = 2;
+            break;
+          case xenos::CompareFunction::kAlways:
+            modification.pixel.rov_depth_profile = normalized_depth_control.z_write_enable ? 3 : 1;
+            break;
+          case xenos::CompareFunction::kLess:
+          case xenos::CompareFunction::kEqual:
+          case xenos::CompareFunction::kLessEqual:
+          case xenos::CompareFunction::kGreater:
+          case xenos::CompareFunction::kNotEqual:
+          case xenos::CompareFunction::kGreaterEqual: {
+            uint32_t compare_index = 0;
+            switch (normalized_depth_control.zfunc) {
+              case xenos::CompareFunction::kLess: compare_index = 0; break;
+              case xenos::CompareFunction::kEqual: compare_index = 1; break;
+              case xenos::CompareFunction::kLessEqual: compare_index = 2; break;
+              case xenos::CompareFunction::kGreater: compare_index = 3; break;
+              case xenos::CompareFunction::kNotEqual: compare_index = 4; break;
+              case xenos::CompareFunction::kGreaterEqual: compare_index = 5; break;
+              default: break;
+            }
+            modification.pixel.rov_depth_profile =
+                4 + compare_index * 2 + uint32_t(normalized_depth_control.z_write_enable);
+          } break;
+          default:
+            break;
+        }
+      }
+    }
+
+    if (REXCVAR_GET(d3d12_rov_blend_profile_specialization) && written_targets == 1 &&
+        modification.pixel.rov_full_write && (modification.pixel.rov_rgba8_targets & 1)) {
+      const uint32_t blend = regs[reg::RB_BLENDCONTROL::rt_register_indices[0]] & 0x1FFF1FFF;
+      if (blend == 0x00010706) {
+        modification.pixel.rov_blend_profile = 1;  // Straight alpha.
+      } else if (blend == 0x07010701) {
+        modification.pixel.rov_blend_profile = 2;  // Premultiplied alpha.
+      } else if (blend == 0x01010101) {
+        modification.pixel.rov_blend_profile = 3;  // Additive.
+      }
+    }
+
+    // Moving the ordered EDRAM access after guest shading is safe only when
+    // the shader has no observable side effects before color output and the
+    // depth test cannot change stencil or coverage. Restrict the first
+    // experiment to replacement-blended color draws with depth testing.
+    const reg::RB_DEPTHCONTROL depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+    const reg::RB_COLORCONTROL color_control = regs.Get<reg::RB_COLORCONTROL>();
+    modification.pixel.rov_late_depth = uint32_t(
+        REXCVAR_GET(d3d12_rov_late_depth) && written_targets &&
+        shader.implicit_early_z_write_allowed() && effective_depth_stencil_enabled &&
+        depth_control.z_enable &&
+        !depth_control.stencil_enable && !draw_util::DoesCoverageDependOnAlpha(color_control) &&
+        modification.pixel.rov_no_blend);
+  }
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -895,12 +1046,112 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
   return modification;
 }
 
+PipelineCache::ROVDrawState PipelineCache::GetCurrentROVDrawState(
+    uint32_t written_color_targets, reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask) const {
+  ROVDrawState state;
+  state.normalized_color_mask = normalized_color_mask;
+  state.depth_stencil_enabled =
+      normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
+  if (render_target_cache_.GetPath() != RenderTargetCache::Path::kPixelShaderInterlock) {
+    return state;
+  }
+
+  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
+  for (uint32_t i = 0; i < 4; ++i) {
+    const auto color_info = register_file_.Get<reg::RB_COLOR_INFO>(
+        reg::RB_COLOR_INFO::rt_register_indices[i]);
+    RenderTargetCache::GetPSIColorFormatInfo(
+        color_info.color_format, (normalized_color_mask >> (i * 4)) & 0xFu,
+        state.rt_clamp[i][0], state.rt_clamp[i][1], state.rt_clamp[i][2], state.rt_clamp[i][3],
+        state.rt_keep_masks[i][0], state.rt_keep_masks[i][1]);
+    if (state.depth_stencil_enabled && (written_color_targets & (1u << i)) &&
+        depth_info.depth_base == color_info.color_base &&
+        (state.rt_keep_masks[i][0] != UINT32_MAX || state.rt_keep_masks[i][1] != UINT32_MAX)) {
+      state.depth_stencil_enabled = false;
+    }
+  }
+  return state;
+}
+
+DxbcShaderTranslator::Modification PipelineCache::GetCurrentDepthOnlyPixelShaderModification(
+    reg::RB_DEPTHCONTROL normalized_depth_control, const ROVDrawState& rov_draw_state) const {
+  DxbcShaderTranslator::Modification modification;
+  if (render_target_cache_.GetPath() != RenderTargetCache::Path::kPixelShaderInterlock) {
+    return modification;
+  }
+  const RegisterFile& regs = register_file_;
+  const uint32_t sample_count_log2 = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  const bool sample_count_variant_enabled =
+      (sample_count_log2 == 0 && REXCVAR_GET(d3d12_rov_sample_count_1x_specialization)) ||
+      (sample_count_log2 == 1 && REXCVAR_GET(d3d12_rov_sample_count_2x_specialization)) ||
+      (sample_count_log2 == 2 && REXCVAR_GET(d3d12_rov_sample_count_4x_specialization));
+  if (REXCVAR_GET(d3d12_rov_sample_count_specialization) && sample_count_variant_enabled) {
+    modification.pixel.rov_sample_count_specialized = 1;
+    modification.pixel.rov_sample_count_log2 = sample_count_log2;
+  }
+  if (REXCVAR_GET(d3d12_rov_depth_profile_specialization)) {
+    if (!rov_draw_state.depth_stencil_enabled) {
+      modification.pixel.rov_depth_profile = 1;
+    } else if (!normalized_depth_control.stencil_enable && normalized_depth_control.z_enable) {
+      switch (normalized_depth_control.zfunc) {
+        case xenos::CompareFunction::kNever:
+          modification.pixel.rov_depth_profile = 2;
+          break;
+        case xenos::CompareFunction::kAlways:
+          modification.pixel.rov_depth_profile = normalized_depth_control.z_write_enable ? 3 : 1;
+          break;
+        case xenos::CompareFunction::kLess:
+        case xenos::CompareFunction::kEqual:
+        case xenos::CompareFunction::kLessEqual:
+        case xenos::CompareFunction::kGreater:
+        case xenos::CompareFunction::kNotEqual:
+        case xenos::CompareFunction::kGreaterEqual: {
+          uint32_t compare_index = 0;
+          switch (normalized_depth_control.zfunc) {
+            case xenos::CompareFunction::kLess: compare_index = 0; break;
+            case xenos::CompareFunction::kEqual: compare_index = 1; break;
+            case xenos::CompareFunction::kLessEqual: compare_index = 2; break;
+            case xenos::CompareFunction::kGreater: compare_index = 3; break;
+            case xenos::CompareFunction::kNotEqual: compare_index = 4; break;
+            case xenos::CompareFunction::kGreaterEqual: compare_index = 5; break;
+            default: break;
+          }
+          modification.pixel.rov_depth_profile =
+              4 + compare_index * 2 + uint32_t(normalized_depth_control.z_write_enable);
+        } break;
+        default:
+          break;
+      }
+    }
+  }
+  return modification;
+}
+
+std::shared_ptr<const std::vector<uint8_t>> PipelineCache::GetDepthOnlyPixelShader(
+    uint64_t modification_value) {
+  if (!modification_value) {
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> map_lock(depth_only_pixel_shaders_mutex_);
+  auto found = depth_only_pixel_shaders_.find(modification_value);
+  if (found != depth_only_pixel_shaders_.end()) {
+    return found->second;
+  }
+  std::lock_guard<std::mutex> translation_lock(translation_request_lock_);
+  auto shader = shader_translator_->CreateDepthOnlyPixelShader(modification_value);
+  auto stored = std::make_shared<const std::vector<uint8_t>>(std::move(shader));
+  depth_only_pixel_shaders_.emplace(modification_value, stored);
+  return stored;
+}
+
 bool PipelineCache::ConfigurePipeline(
     D3D12Shader::D3D12Translation* vertex_shader, D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
     uint32_t bound_depth_and_color_render_target_bits,
-    const uint32_t* bound_depth_and_color_render_target_formats, void** pipeline_handle_out,
+    const uint32_t* bound_depth_and_color_render_target_formats,
+    uint64_t pixel_shader_modification, void** pipeline_handle_out,
     ID3D12RootSignature** root_signature_out) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -982,7 +1233,8 @@ bool PipelineCache::ConfigurePipeline(
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
           normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, runtime_description, use_async)) {
+          bound_depth_and_color_render_target_formats, pixel_shader_modification,
+          runtime_description, use_async)) {
     return false;
   }
   PipelineDescription& description = runtime_description.description;
@@ -1010,7 +1262,7 @@ bool PipelineCache::ConfigurePipeline(
   PROFILE_PIPELINE_CACHE_MISS();
 
   Pipeline* new_pipeline = new Pipeline;
-  std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
+  new_pipeline->description = runtime_description;
   new_pipeline->root_signature.store(runtime_description.root_signature, std::memory_order_release);
   pipelines_.emplace(hash, new_pipeline);
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
@@ -1238,6 +1490,7 @@ bool PipelineCache::GetCurrentStateDescription(
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
     uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
+    uint64_t pixel_shader_modification,
     PipelineRuntimeDescription& runtime_description_out, bool for_placeholder) {
   // Translated shaders needed at least for the root signature, unless in
   // placeholder mode (async compilation) where both VS and PS translation
@@ -1252,7 +1505,7 @@ bool PipelineCache::GetCurrentStateDescription(
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
 
   // Initialize all unused fields to zero for comparison/hashing.
-  std::memset(&runtime_description_out, 0, sizeof(runtime_description_out));
+  runtime_description_out = {};
 
   assert_true(DxbcShaderTranslator::Modification(vertex_shader->modification())
                   .vertex.host_vertex_shader_type ==
@@ -1360,6 +1613,10 @@ bool PipelineCache::GetCurrentStateDescription(
     runtime_description_out.pixel_shader = pixel_shader;
     description_out.pixel_shader_hash = pixel_shader->shader().ucode_data_hash();
     description_out.pixel_shader_modification = pixel_shader->modification();
+  } else {
+    description_out.pixel_shader_modification = pixel_shader_modification;
+    runtime_description_out.depth_only_pixel_shader =
+        GetDepthOnlyPixelShader(pixel_shader_modification);
   }
 
   // Rasterizer state.
@@ -1720,7 +1977,7 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
       auto rdef_constants =
           reinterpret_cast<dxbc::RdefVariable*>(shader_out.data() + rdef_constants_position_dwords);
       // float2 xe_point_constant_diameter
-      static_assert(sizeof(DxbcShaderTranslator::SystemConstants ::point_constant_diameter) ==
+      static_assert(sizeof(DxbcShaderTranslator::SystemConstants::point_constant_diameter) ==
                         sizeof(float) * 2,
                     "DxbcShaderTranslator point_constant_diameter system constant size "
                     "differs between the shader translator and geometry shader "
@@ -1739,7 +1996,7 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
       rdef_constant_point_constant_diameter.start_sampler = UINT32_MAX;
       // float2 xe_point_screen_diameter_to_ndc_radius
       static_assert(
-          sizeof(DxbcShaderTranslator::SystemConstants ::point_screen_diameter_to_ndc_radius) ==
+          sizeof(DxbcShaderTranslator::SystemConstants::point_screen_diameter_to_ndc_radius) ==
               sizeof(float) * 2,
           "DxbcShaderTranslator point_screen_diameter_to_ndc_radius system "
           "constant size differs between the shader translator and geometry "
@@ -2836,8 +3093,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.pShaderBytecode = runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength = runtime_description.pixel_shader->translated_binary().size();
   } else if (edram_rov_used) {
-    state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
-    state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
+    const std::vector<uint8_t>& depth_only_pixel_shader =
+        runtime_description.depth_only_pixel_shader
+            ? *runtime_description.depth_only_pixel_shader
+            : depth_only_pixel_shader_;
+    state_desc.PS.pShaderBytecode = depth_only_pixel_shader.data();
+    state_desc.PS.BytecodeLength = depth_only_pixel_shader.size();
   } else {
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) &&
@@ -3133,7 +3394,7 @@ void PipelineCache::StorageWriteThread() {
 bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
     Pipeline* pipeline, PipelineRuntimeDescription& runtime_description) {
   assert_not_null(pipeline);
-  std::memcpy(&runtime_description, &pipeline->description, sizeof(runtime_description));
+  runtime_description = pipeline->description;
   runtime_description.root_signature = pipeline->root_signature.load(std::memory_order_acquire);
 
   auto translate_pending_shader = [this](D3D12Shader::D3D12Translation* translation,

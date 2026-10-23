@@ -1,0 +1,26 @@
+ReXGlue SDK copyright and BSD terms are preserved in LICENSE.
+Portions derive from Xenia; preserve the notices in the source files.
+Original Linux-port contributions by tutifrutas are BSD-3-Clause.
+
+Third-party software is not relicensed by the SDK's BSD license.
+
+- thirdparty/disasm contains GNU binutils-derived disassembler source under
+  GPL-2.0-or-later (and compatible earlier-version grants in some portions).
+  The GPL text is in thirdparty/disasm/COPYING. Linking the disassembler into
+  the SDK tool creates obligations beyond the BSD license; preserve source,
+  license texts and applicable redistribution rights when distributing it.
+- thirdparty/FFmpeg is a pinned fork with its own COPYING files. The configured
+  codecs and build options determine the applicable LGPL/GPL obligations.
+- thirdparty/libmspack carries its own LGPL license.
+- Other submodules retain their upstream license files at the pinned revisions.
+  Their public source URLs are recorded in .gitmodules.
+- Vendored AES, crypto, DXBC checksum, DXC API, PE format, RenderDoc, stb and
+  disruptorplus files retain their original copyright and license notices.
+  Do not treat a missing standalone license file as a grant from tutifrutas.
+- dxbc-spirv is fetched from https://github.com/doitsujin/dxbc-spirv and retains
+  its upstream license. Its pinned revision is in
+  src/graphics/vulkan/dxbc_spirv_dependency.cmake.
+
+No license here grants rights to game executables, generated guest code,
+game assets, title updates or trademarks. No proprietary game files or
+prebuilt third-party toolchain binaries are distributed in this source tree.

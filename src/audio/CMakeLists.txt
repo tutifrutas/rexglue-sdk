@@ -6,7 +6,13 @@ add_library(rexaudio OBJECT
     audio_driver.cpp
     audio_system.cpp
     downmix.cpp
+    nop_audio_driver.cpp
+    pacing_audio_driver.cpp
     xma_context.cpp
+    xma_context_fake.cpp
+    xma_context_master.cpp
+    xma_context_new.cpp
+    xma_context_old.cpp
     xma_decoder.cpp
     xma_register_file.cpp
     # NOP backend (always available)

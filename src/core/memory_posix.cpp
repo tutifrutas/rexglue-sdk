@@ -63,7 +63,7 @@ namespace memory {
 // Convert a filesystem path to a valid shm_open name (must start with /, no other slashes).
 // macOS enforces a 31-character total limit, so long names are folded from the full path rather
 // than only the filename. This keeps equal filenames in different directories distinct.
-static std::string MakeShmName(const std::filesystem::path& path) {
+[[maybe_unused]] static std::string MakeShmName(const std::filesystem::path& path) {
   std::string name = path.string();
   for (char& c : name) {
     if (c == '/') {
@@ -454,6 +454,19 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ashmem_fd);
+#elif REX_PLATFORM_LINUX
+  // Anonymous memfd: no /dev/shm name shared between concurrent instances and
+  // nothing left behind after a crash. Map protection is chosen per view.
+  (void)access;
+  int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
+  if (fd < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
+    close(fd);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(fd);
 #else
   int oflag;
   switch (access) {
@@ -489,7 +502,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_LINUX
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif

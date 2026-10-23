@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20261019;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -176,6 +176,22 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // ROV - all written color targets use the 1 * source + 0 * destination
+      // blend equation, so the blending implementation can be omitted.
+      uint32_t rov_no_blend : 1;
+      // ROV - run eligible guest shading before depth/stencil access.
+      uint32_t rov_late_depth : 1;
+      // ROV - compile sample processing for the active guest sample count.
+      uint32_t rov_sample_count_specialized : 1;
+      uint32_t rov_sample_count_log2 : 2;
+      // ROV - targets whose format is known to be linear RGBA8.
+      uint32_t rov_rgba8_targets : 4;
+      // ROV - all statically exported targets are active and fully writable.
+      uint32_t rov_full_write : 1;
+      // ROV - canonical no-stencil depth profile, zero means dynamic fallback.
+      uint32_t rov_depth_profile : 4;
+      // ROV - exact common blend equation, zero means dynamic fallback.
+      uint32_t rov_blend_profile : 2;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -513,7 +529,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Creates a special pixel shader without color outputs - this resets the
   // state of the translator.
-  std::vector<uint8_t> CreateDepthOnlyPixelShader();
+  std::vector<uint8_t> CreateDepthOnlyPixelShader(uint64_t modification_value = 0);
 
   // Common functions useful not only for the translator, but also for render
   // target reinterpretation.
@@ -708,7 +724,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
   bool ROV_IsDepthStencilEarly() const {
     assert_true(edram_rov_used_);
     return !is_depth_only_pixel_shader_ && !current_shader().writes_depth() &&
-           !current_shader().memexport_eM_written();
+           !current_shader().memexport_eM_written() &&
+           !GetDxbcShaderModification().pixel.rov_late_depth;
+  }
+  bool ROV_IsSampleCountSpecialized() const {
+    return edram_rov_used_ && GetDxbcShaderModification().pixel.rov_sample_count_specialized;
+  }
+  uint32_t ROV_GetSampleCountLog2() const {
+    return GetDxbcShaderModification().pixel.rov_sample_count_log2;
+  }
+  uint32_t ROV_GetSampleCount() const {
+    return ROV_IsSampleCountSpecialized() ? (1u << ROV_GetSampleCountLog2()) : 4u;
+  }
+  bool ROV_IsRGBA8TargetSpecialized(uint32_t rt_index) const {
+    return edram_rov_used_ && rt_index < 4 &&
+           (GetDxbcShaderModification().pixel.rov_rgba8_targets & (1u << rt_index));
   }
   // Converts the pre-clamped depth value to 24-bit (storing the result in bits
   // 0:23 and zeros in 24:31, not creating room for stencil - since this may be

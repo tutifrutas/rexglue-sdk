@@ -79,13 +79,13 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
 }
 DxbcShaderTranslator::~DxbcShaderTranslator() = default;
 
-std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader() {
+std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(uint64_t modification_value) {
   is_depth_only_pixel_shader_ = true;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_pixel_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
   Shader shader(xenos::ShaderType::kPixel, 0, nullptr, 0);
   shader.AnalyzeUcode(instruction_disassembly_buffer_);
-  Shader::Translation& translation = *shader.GetOrCreateTranslation(0);
+  Shader::Translation& translation = *shader.GetOrCreateTranslation(modification_value);
   TranslateAnalyzedShader(translation);
   is_depth_only_pixel_shader_ = false;
   return translation.translated_binary();

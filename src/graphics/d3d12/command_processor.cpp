@@ -1928,6 +1928,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     return;
   }
+  graphics_system_->RecordGuestRenderScale(texture_cache_->draw_resolution_scale_x(),
+                                          texture_cache_->draw_resolution_scale_y());
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
@@ -2342,6 +2344,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  const PipelineCache::ROVDrawState rov_draw_state = pipeline_cache_->GetCurrentROVDrawState(
+      pixel_shader ? pixel_shader->writes_color_targets() : 0, normalized_depth_control,
+      normalized_color_mask);
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -2357,13 +2365,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
-                *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
-          : DxbcShaderTranslator::Modification(0);
+                *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control,
+                rov_draw_state)
+          : pipeline_cache_->GetCurrentDepthOnlyPixelShaderModification(normalized_depth_control,
+                                                                         rov_draw_state);
 
   // Set up the render targets - this may perform dispatches and draws.
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -2395,7 +2402,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
+          bound_depth_and_color_render_target_formats, pixel_shader_modification.value,
+          &pipeline_handle, &root_signature)) {
     return false;
   }
   if (REXCVAR_GET(async_shader_compilation) &&
@@ -2467,7 +2475,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+                             used_texture_mask, normalized_depth_control, rov_draw_state);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -3586,7 +3594,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    const PipelineCache::ROVDrawState& rov_draw_state) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3610,6 +3618,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   bool edram_rov_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const uint32_t normalized_color_mask = rov_draw_state.normalized_color_mask;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
@@ -3621,32 +3630,26 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // flow.
   reg::RB_COLOR_INFO color_infos[4];
   float rt_clamp[4][4];
-  // Two UINT32_MAX if no components actually existing in the RT are written.
   uint32_t rt_keep_masks[4][2];
   for (uint32_t i = 0; i < 4; ++i) {
     auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
     color_infos[i] = color_info;
     if (edram_rov_used) {
-      RenderTargetCache::GetPSIColorFormatInfo(
-          color_info.color_format, (normalized_color_mask >> (i * 4)) & 0b1111, rt_clamp[i][0],
-          rt_clamp[i][1], rt_clamp[i][2], rt_clamp[i][3], rt_keep_masks[i][0], rt_keep_masks[i][1]);
+      std::memcpy(rt_clamp[i], rov_draw_state.rt_clamp[i], sizeof(rt_clamp[i]));
+      rt_keep_masks[i][0] = rov_draw_state.rt_keep_masks[i][0];
+      rt_keep_masks[i][1] = rov_draw_state.rt_keep_masks[i][1];
+    } else {
+      rt_keep_masks[i][0] = UINT32_MAX;
+      rt_keep_masks[i][1] = UINT32_MAX;
     }
   }
 
   // Disable depth and stencil if it aliases a color render target (for
   // instance, during the XBLA logo in 58410954, though depth writing is already
   // disabled there).
-  bool depth_stencil_enabled =
-      normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
-  if (edram_rov_used && depth_stencil_enabled) {
-    for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
-          (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX)) {
-        depth_stencil_enabled = false;
-        break;
-      }
-    }
-  }
+  const bool depth_stencil_enabled =
+      edram_rov_used ? rov_draw_state.depth_stencil_enabled
+                     : (normalized_depth_control.stencil_enable || normalized_depth_control.z_enable);
 
   bool dirty = false;
 

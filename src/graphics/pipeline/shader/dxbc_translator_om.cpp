@@ -23,7 +23,11 @@ namespace rex::graphics {
 using namespace ucode;
 
 void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
-  bool any_color_targets_written = current_shader().writes_color_targets() != 0;
+  const uint32_t written_color_targets = current_shader().writes_color_targets();
+  bool any_color_targets_written = written_color_targets != 0;
+  const uint32_t rgba8_targets = GetDxbcShaderModification().pixel.rov_rgba8_targets;
+  const bool all_color_targets_rgba8 =
+      any_color_targets_written && (rgba8_targets & written_color_targets) == written_color_targets;
 
   // ***************************************************************************
   // Get EDRAM offsets for the pixel:
@@ -51,9 +55,17 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // Convert the position from pixels to samples.
   // system_temp_rov_params_.x = X sample 0 position
   // system_temp_rov_params_.y = Y sample 0 position
-  a_.OpIShL(dxbc::Dest::R(system_temp_rov_params_, 0b0011), dxbc::Src::R(system_temp_rov_params_),
-            LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                               offsetof(SystemConstants, sample_count_log2), 0b0100));
+  if (ROV_IsSampleCountSpecialized()) {
+    // Xenos stores 2x MSAA vertically and 4x MSAA in a 2x2 sample grid.
+    // The logarithm of the total sample count isn't the shift for each axis.
+    const uint32_t sample_count = ROV_GetSampleCount();
+    a_.OpIShL(dxbc::Dest::R(system_temp_rov_params_, 0b0011), dxbc::Src::R(system_temp_rov_params_),
+              dxbc::Src::LU(sample_count == 4 ? 1 : 0, sample_count >= 2 ? 1 : 0, 0, 0));
+  } else {
+    a_.OpIShL(dxbc::Dest::R(system_temp_rov_params_, 0b0011), dxbc::Src::R(system_temp_rov_params_),
+              LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                                 offsetof(SystemConstants, sample_count_log2), 0b0100));
+  }
   // For cases of both color and depth:
   //   Get 40 x 16 x resolution scale 32bpp half-tile or 40x16 64bpp tile index
   //   to system_temp_rov_params_.zw, and put the sample index within such a
@@ -150,43 +162,46 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW),
               dxbc::Src::R(rov_address_temp, dxbc::Src::kXXXX));
 
-    // Get the dword offset of the beginning of the row of samples within a row
-    // of 64bpp 80x16 tiles to system_temp_rov_params_.y (last time the
-    // tile-local Y offset is needed).
-    // system_temp_rov_params_.x = X sample 0 position within the half-tile
-    // system_temp_rov_params_.y = dword offset of the beginning of the row of
-    //                             samples within a row of 64bpp tiles
-    // system_temp_rov_params_.z = X half-tile position
-    // system_temp_rov_params_.w = Y tile row dword origin in a 32bpp surface
-    // rov_address_temp.x = dword offset of the beginning of the row of samples
-    //                      within a 32bpp surface
-    a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ), dxbc::Src::LU(tile_size),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY));
-    // Get the dword offset of the beginning of the row of samples within a
-    // 64bpp surface to system_temp_rov_params_.w (last time the Y tile row
-    // offset is needed).
-    // system_temp_rov_params_.x = X sample 0 position within the half-tile
-    // system_temp_rov_params_.y = free
-    // system_temp_rov_params_.z = X half-tile position
-    // system_temp_rov_params_.w = dword offset of the beginning of the row of
-    //                             samples within a 64bpp surface
-    // rov_address_temp.x = dword offset of the beginning of the row of samples
-    //                      within a 32bpp surface
-    a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b1000),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW), dxbc::Src::LU(2),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY));
+    if (!all_color_targets_rgba8) {
+      // Get the dword offset of the beginning of the row of samples within a row
+      // of 64bpp 80x16 tiles to system_temp_rov_params_.y (last time the
+      // tile-local Y offset is needed).
+      // system_temp_rov_params_.x = X sample 0 position within the half-tile
+      // system_temp_rov_params_.y = dword offset of the beginning of the row of
+      //                             samples within a row of 64bpp tiles
+      // system_temp_rov_params_.z = X half-tile position
+      // system_temp_rov_params_.w = Y tile row dword origin in a 32bpp surface
+      // rov_address_temp.x = dword offset of the beginning of the row of samples
+      //                      within a 32bpp surface
+      a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ), dxbc::Src::LU(tile_size),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY));
+      // Get the dword offset of the beginning of the row of samples within a
+      // 64bpp surface to system_temp_rov_params_.w (last time the Y tile row
+      // offset is needed).
+      // system_temp_rov_params_.x = X sample 0 position within the half-tile
+      // system_temp_rov_params_.y = free
+      // system_temp_rov_params_.z = X half-tile position
+      // system_temp_rov_params_.w = dword offset of the beginning of the row of
+      //                             samples within a 64bpp surface
+      // rov_address_temp.x = dword offset of the beginning of the row of samples
+      //                      within a 32bpp surface
+      a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b1000),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW), dxbc::Src::LU(2),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY));
 
-    // Get the final offset of the sample 0 within a 64bpp surface to
-    // system_temp_rov_params_.w.
-    // system_temp_rov_params_.x = X sample 0 position within the half-tile
-    // system_temp_rov_params_.z = X half-tile position
-    // system_temp_rov_params_.w = dword sample 0 offset within a 64bpp surface
-    // rov_address_temp.x = dword offset of the beginning of the row of samples
-    //                      within a 32bpp surface
-    a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b1000),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(2),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW));
+      // Get the final offset of the sample 0 within a 64bpp surface to
+      // system_temp_rov_params_.w.
+      // system_temp_rov_params_.x = X sample 0 position within the half-tile
+      // system_temp_rov_params_.z = X half-tile position
+      // system_temp_rov_params_.w = dword sample 0 offset within a 64bpp surface
+      // rov_address_temp.x = dword offset of the beginning of the row of samples
+      //                      within a 32bpp surface
+      a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b1000),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(2),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW));
+
+    }
 
     // Get the half-tile index within the tile to system_temp_rov_params_.y
     // (last time the X half-tile position is needed).
@@ -331,10 +346,10 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // Using ForcedSampleCount of 4 (2 is not supported on Nvidia), so for 2x
   // MSAA, handling samples 0 and 3 (upper-left and lower-right) as 0 and 1.
 
-  // Check if 4x MSAA is enabled.
-  a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                                   offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
-  {
+  if (ROV_IsSampleCountSpecialized() && ROV_GetSampleCount() == 1) {
+    a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::VCoverage(),
+             dxbc::Src::LU(1));
+  } else if (ROV_IsSampleCountSpecialized() && ROV_GetSampleCount() == 4) {
     // Copy the 4x AA coverage to system_temp_rov_params_.x, making top-right
     // the sample [2] and bottom-left the sample [1] (the opposite of Direct3D
     // 12), because on the Xbox 360, 2x MSAA doubles the storage height, 4x MSAA
@@ -345,10 +360,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(29));
     a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(1),
              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
-  }
-  // Handle 1 or 2 samples.
-  a_.OpElse();
-  {
+  } else if (ROV_IsSampleCountSpecialized()) {
     // Extract sample 3 coverage, which will be used as sample 1.
     a_.OpUBFE(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(3),
               dxbc::Src::VCoverage());
@@ -356,9 +368,23 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
     // system_temp_rov_params_.x).
     a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+  } else {
+    // Preserve the runtime sample-count selection for the general variant.
+    a_.OpIf(true,
+            LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                               offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
+    a_.OpBFRev(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::VCoverage());
+    a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
+              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(29));
+    a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(1),
+             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+    a_.OpElse();
+    a_.OpUBFE(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(3),
+              dxbc::Src::VCoverage());
+    a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
+             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+    a_.OpEndIf();
   }
-  // Close the 4x MSAA conditional.
-  a_.OpEndIf();
 }
 
 void DxbcShaderTranslator::ROV_DepthStencilTest() {
@@ -372,648 +398,715 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
   dxbc::Dest temp_w_dest(dxbc::Dest::R(temp, 0b1000));
   dxbc::Src temp_w_src(dxbc::Src::R(temp, dxbc::Src::kWWWW));
 
-  // Check whether depth/stencil is enabled.
-  // temp.x = kSysFlag_ROVDepthStencil
-  a_.OpAnd(temp_x_dest, LoadFlagsSystemConstant(), dxbc::Src::LU(kSysFlag_ROVDepthStencil));
-  // Open the depth/stencil enabled conditional.
-  // temp.x = free
-  a_.OpIf(true, temp_x_src);
-
-  bool shader_writes_depth = current_shader().writes_depth();
-  bool depth_stencil_early = ROV_IsDepthStencilEarly();
-
-  dxbc::Src z_ddx_src(dxbc::Src::LF(0.0f)), z_ddy_src(dxbc::Src::LF(0.0f));
-
-  if (shader_writes_depth) {
-    // Convert the shader-generated depth to 24-bit, using temp.x as
-    // temporary. oDepth is already written by StoreResult with saturation,
-    // no need to clamp here. Adreno 200 doesn't have PA_SC_VPORT_ZMIN/ZMAX,
-    // so likely there's no need to clamp to the viewport depth bounds.
-    ROV_DepthTo24Bit(system_temp_depth_stencil_, 0, system_temp_depth_stencil_, 0, temp, 0);
-  } else {
-    dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
-    // Get the derivatives of the screen-space (but not clamped to the viewport
-    // depth bounds yet - this happens after the pixel shader in Direct3D 11+;
-    // also linear within the triangle - thus constant derivatives along the
-    // triangle) Z for calculating per-sample depth values and the slope-scaled
-    // polygon offset.
-    // We're using derivatives instead of eval_sample_index for various reasons:
-    // - eval_sample_index doesn't work with SV_Position - need to use an
-    //   additional interpolant.
-    // - On AMD, eval_sample_index is actually implemented via calculation and
-    //   scaling of derivatives of barycentric coordinates, therefore there's no
-    //   advantage of using it there.
-    // - eval_sample_index is (inconsistently, but often) one of the sources of
-    //   the infamous AMD shader compiler crashes when ROV is used in Xenia, in
-    //   addition to shader compiler crashes on WARP.
-    if (depth_stencil_early) {
-      z_ddx_src = dxbc::Src::R(temp, dxbc::Src::kXXXX);
-      z_ddy_src = dxbc::Src::R(temp, dxbc::Src::kYYYY);
-      // temp.x = ddx(z)
-      // temp.y = ddy(z)
-      in_position_used_ |= 0b0100;
-      a_.OpDerivRTXCoarse(temp_x_dest, in_position_z);
-      a_.OpDerivRTYCoarse(temp_y_dest, in_position_z);
-    } else {
-      // For late depth / stencil testing, derivatives are calculated in the
-      // beginning of the shader before any return statement is possibly
-      // reached, and written to system_temp_depth_stencil_.xy.
-      assert_true(system_temp_depth_stencil_ != UINT32_MAX);
-      z_ddx_src = dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX);
-      z_ddy_src = dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kYYYY);
-    }
-    // Get the maximum depth slope for polygon offset.
-    // https://docs.microsoft.com/en-us/windows/desktop/direct3d9/depth-bias
-    // temp.x if early = ddx(z)
-    // temp.y if early = ddy(z)
-    // temp.z = max(|ddx(z)|, |ddy(z)|)
-    a_.OpMax(temp_z_dest, z_ddx_src.Abs(), z_ddy_src.Abs());
-    // Calculate the depth bias for the needed faceness.
-    in_front_face_used_ = true;
-    a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX));
-    // temp.x if early = ddx(z)
-    // temp.y if early = ddy(z)
-    // temp.z = front face polygon offset
-    // temp.w = free
-    a_.OpMAd(
-        temp_z_dest, temp_z_src,
-        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
-                           offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kXXXX),
-        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
-                           offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kYYYY));
-    a_.OpElse();
-    // temp.x if early = ddx(z)
-    // temp.y if early = ddy(z)
-    // temp.z = back face polygon offset
-    // temp.w = free
-    a_.OpMAd(
-        temp_z_dest, temp_z_src,
-        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
-                           offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kXXXX),
-        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
-                           offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kYYYY));
-    a_.OpEndIf();
-    // Apply the post-clip and post-viewport polygon offset to the fragment's
-    // depth. Not clamping yet as this is at the center, which is not
-    // necessarily covered and not necessarily inside the bounds - derivatives
-    // scaled by sample positions will be added to this value, and it must be
-    // linear.
-    // temp.x if early = ddx(z)
-    // temp.y if early = ddy(z)
-    // temp.z = biased depth in the center
-    in_position_used_ |= 0b0100;
-    a_.OpAdd(temp_z_dest, temp_z_src, in_position_z);
-  }
-
-  for (uint32_t i = 0; i < 4; ++i) {
-    // With early depth/stencil, depth/stencil writing may be deferred to the
-    // end of the shader to prevent writing in case something (like alpha test,
-    // which is dynamic GPU state) discards the pixel. So, write directly to the
-    // persistent register, system_temp_depth_stencil_, instead of a local
-    // temporary register.
-    dxbc::Dest sample_depth_stencil_dest(
-        depth_stencil_early ? dxbc::Dest::R(system_temp_depth_stencil_, 1 << i) : temp_w_dest);
-    dxbc::Src sample_depth_stencil_src(
-        depth_stencil_early ? dxbc::Src::R(system_temp_depth_stencil_).Select(i) : temp_w_src);
-
-    // Get if the current sample is covered.
-    // temp.x if no oDepth and early = ddx(z)
-    // temp.y if no oDepth and early = ddy(z)
-    // temp.z if no oDepth = biased depth in the center
-    // temp.w = coverage of the current sample
-    a_.OpAnd(temp_w_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-             dxbc::Src::LU(1 << i));
-    // Check if the current sample is covered.
-    // temp.x if no oDepth and early = ddx(z)
-    // temp.y if no oDepth and early = ddy(z)
-    // temp.z if no oDepth = biased depth in the center
-    // temp.w = free
-    a_.OpIf(true, temp_w_src);
-
-    uint32_t sample_temp = PushSystemTemp();
-    dxbc::Dest sample_temp_x_dest(dxbc::Dest::R(sample_temp, 0b0001));
-    dxbc::Src sample_temp_x_src(dxbc::Src::R(sample_temp, dxbc::Src::kXXXX));
-    dxbc::Dest sample_temp_y_dest(dxbc::Dest::R(sample_temp, 0b0010));
-    dxbc::Src sample_temp_y_src(dxbc::Src::R(sample_temp, dxbc::Src::kYYYY));
-    dxbc::Dest sample_temp_z_dest(dxbc::Dest::R(sample_temp, 0b0100));
-    dxbc::Src sample_temp_z_src(dxbc::Src::R(sample_temp, dxbc::Src::kZZZZ));
-    dxbc::Dest sample_temp_w_dest(dxbc::Dest::R(sample_temp, 0b1000));
-    dxbc::Src sample_temp_w_src(dxbc::Src::R(sample_temp, dxbc::Src::kWWWW));
-
-    if (shader_writes_depth) {
-      // Copy the 24-bit depth common to all samples to sample_depth_stencil.
-      // temp.w = shader-generated 24-bit depth
-      assert_false(depth_stencil_early);
-      a_.OpMov(sample_depth_stencil_dest,
-               dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX));
-    } else {
-      // Adreno 200 doesn't have PA_SC_VPORT_ZMIN/ZMAX, so likely there's no
-      // need to clamp to the viewport depth bounds, just to 0...1 - thus only
-      // saturating in the end of the per-sample depth calculation.
-      switch (i) {
-        case 0:
-          // First sample - off-center for MSAA, in the center without it.
-          // Using ForcedSampleCount 4 for both 2x and 4x MSAA because
-          // ForcedSampleCount 2 is not supported on Nvidia, thus the position
-          // of the top-left sample (0 in Xenia) is always that of the top-left
-          // sample of host 4x MSAA.
-          // Calculate the depth in the sample 0 for 2x or 4x MSAA.
-          // temp.x if early = ddx(z)
-          // temp.y if early = ddy(z)
-          // temp.z = biased depth in the center
-          // temp.w if late = unsaturated sample 0 depth at 4x MSAA
-          a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[0][0] * (1.0f / 16.0f)),
-                   temp_z_src);
-          a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[0][1] * (1.0f / 16.0f)),
-                   sample_depth_stencil_src);
-          // Choose between the sample and the center depth depending on whether
-          // at least 2x MSAA is enabled and saturate.
-          // temp.x if early = ddx(z)
-          // temp.y if early = ddy(z)
-          // temp.z = biased depth in the center
-          // temp.w if late = sample 0 depth
-          a_.OpMovC(
-              sample_depth_stencil_dest,
-              LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                                 offsetof(SystemConstants, sample_count_log2), dxbc::Src::kYYYY),
-              sample_depth_stencil_src, temp_z_src, true);
-          break;
-        case 1:
-          // - 2x MSAA: Bottom sample -> bottom-right (3) with Direct3D 11's
-          //   ForcedSampleCount 4.
-          // - 4x MSAA: Bottom-left Xenia sample -> Direct3D 11 sample 2.
-          // Check if 4x MSAA is used.
-          a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                                           offsetof(SystemConstants, sample_count_log2),
-                                           dxbc::Src::kXXXX));
-          // 4x MSAA.
-          // temp.x if early = ddx(z)
-          // temp.y if early = ddy(z)
-          // temp.z = biased depth in the center
-          // temp.w if late = saturated sample 1 depth at 4x MSAA
-          a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[2][0] * (1.0f / 16.0f)),
-                   temp_z_src);
-          a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[2][1] * (1.0f / 16.0f)),
-                   sample_depth_stencil_src, true);
-          a_.OpElse();
-          // 2x MSAA as ForcedSampleCount 4 on the host.
-          // temp.x if early = ddx(z)
-          // temp.y if early = ddy(z)
-          // temp.z = biased depth in the center
-          // temp.w if late = saturated sample 1 depth at 2x MSAA
-          a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[3][0] * (1.0f / 16.0f)),
-                   temp_z_src);
-          a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[3][1] * (1.0f / 16.0f)),
-                   sample_depth_stencil_src, true);
-          a_.OpEndIf();
-          break;
-        default: {
-          // Xenia samples 2 and 3 (top-right and bottom-right) -> Direct3D 11
-          // samples 1 and 3.
-          // temp.x if early = ddx(z)
-          // temp.y if early = ddy(z)
-          // temp.z = biased depth in the center
-          // temp.w if late = saturated sample 2 or 3 depth
-          const int8_t* sample_position =
-              draw_util::kD3D10StandardSamplePositions4x[i ^ (((i & 1) ^ (i >> 1)) * 0b11)];
-          a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
-                   dxbc::Src::LF(sample_position[0] * (1.0f / 16.0f)), temp_z_src);
-          a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
-                   dxbc::Src::LF(sample_position[1] * (1.0f / 16.0f)), sample_depth_stencil_src,
-                   true);
-        } break;
-      }
-      // Convert the sample's depth to 24-bit, using sample_temp.x as a
-      // temporary.
-      // temp.x if early = ddx(z)
-      // temp.y if early = ddy(z)
-      // temp.z = biased depth in the center
-      // temp.w if late = sample's 24-bit Z
-      ROV_DepthTo24Bit(sample_depth_stencil_src.index_1d_.index_,
-                       sample_depth_stencil_src.swizzle_ & 3,
-                       sample_depth_stencil_src.index_1d_.index_,
-                       sample_depth_stencil_src.swizzle_ & 3, sample_temp, 0);
-    }
-
-    // Load the old depth/stencil value.
-    // sample_temp.x = old depth/stencil
-    if (uav_index_edram_ == kBindingIndexUnallocated) {
-      uav_index_edram_ = uav_count_++;
-    }
-    a_.OpLdUAVTyped(
-        sample_temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
-        dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
-
-    // Depth test.
-
-    // Extract the old depth part to sample_depth_stencil.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    a_.OpUShR(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(8));
-    // Get the difference between the new and the old depth, > 0 - greater,
-    // == 0 - equal, < 0 - less.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = depth difference
-    a_.OpIAdd(sample_temp_z_dest, sample_depth_stencil_src, -sample_temp_y_src);
-    // Check if the depth is "less" or "greater or equal".
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = depth difference
-    // sample_temp.w = depth difference less than 0
-    a_.OpILT(sample_temp_w_dest, sample_temp_z_src, dxbc::Src::LI(0));
-    // Choose the passed depth function bits for "less" or for "greater".
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = depth difference
-    // sample_temp.w = depth function passed bits for "less" or "greater"
-    a_.OpMovC(sample_temp_w_dest, sample_temp_w_src, dxbc::Src::LU(kSysFlag_ROVDepthPassIfLess),
-              dxbc::Src::LU(kSysFlag_ROVDepthPassIfGreater));
-    // Do the "equal" testing.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = depth function passed bits
-    // sample_temp.w = free
-    a_.OpMovC(sample_temp_z_dest, sample_temp_z_src, sample_temp_w_src,
-              dxbc::Src::LU(kSysFlag_ROVDepthPassIfEqual));
-    // Mask the resulting bits with the ones that should pass.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = masked depth function passed bits
-    a_.OpAnd(sample_temp_z_dest, sample_temp_z_src, LoadFlagsSystemConstant());
-    // Check if depth test has passed.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = old depth
-    // sample_temp.z = free
-    a_.OpIf(true, sample_temp_z_src);
-    {
-      // Extract the depth write flag.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = old depth
-      // sample_temp.z = depth write mask
-      a_.OpAnd(sample_temp_z_dest, LoadFlagsSystemConstant(),
-               dxbc::Src::LU(kSysFlag_ROVDepthWrite));
-      // If depth writing is disabled, don't change the depth.
-      // temp.x if no oDepth and early = ddx(z)
-      // temp.y if no oDepth and early = ddy(z)
-      // temp.z if no oDepth = biased depth in the center
-      // temp.w if late = resulting sample depth after the depth test
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = free
-      // sample_temp.z = free
-      a_.OpMovC(sample_depth_stencil_dest, sample_temp_z_src, sample_depth_stencil_src,
-                sample_temp_y_src);
-    }
-    // Depth test has failed.
-    a_.OpElse();
-    {
-      // Exclude the bit from the covered sample mask.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = old depth
+  const uint32_t depth_profile = GetDxbcShaderModification().pixel.rov_depth_profile;
+  if (depth_profile == 2) {
+    // Never rejects every sample while retaining the existing early/late test
+    // position and the shader's side-effect behavior.
+    for (uint32_t i = 0; i < ROV_GetSampleCount(); ++i) {
       a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
                dxbc::Src::LU(~uint32_t(1 << i)));
     }
-    a_.OpEndIf();
-    // Create packed depth/stencil, with the stencil value unchanged at this
-    // point.
-    // temp.x if no oDepth and early = ddx(z)
-    // temp.y if no oDepth and early = ddy(z)
-    // temp.z if no oDepth = biased depth in the center
-    // temp.w if late = resulting sample depth, current resulting stencil
-    // sample_temp.x = old depth/stencil
-    a_.OpBFI(sample_depth_stencil_dest, dxbc::Src::LU(24), dxbc::Src::LU(8),
-             sample_depth_stencil_src, sample_temp_x_src);
+  } else if (depth_profile != 1) {
+    // Check whether depth/stencil is enabled.
+    // temp.x = kSysFlag_ROVDepthStencil
+    a_.OpAnd(temp_x_dest, LoadFlagsSystemConstant(), dxbc::Src::LU(kSysFlag_ROVDepthStencil));
+    // Open the depth/stencil enabled conditional.
+    // temp.x = free
+    a_.OpIf(true, temp_x_src);
 
-    // Stencil test.
+    bool shader_writes_depth = current_shader().writes_depth();
+    bool depth_stencil_early = ROV_IsDepthStencilEarly();
 
-    // Extract the stencil test bit.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = stencil test enabled
-    a_.OpAnd(sample_temp_y_dest, LoadFlagsSystemConstant(), dxbc::Src::LU(kSysFlag_ROVStencilTest));
-    // Check if stencil test is enabled.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = free
-    a_.OpIf(true, sample_temp_y_src);
-    {
-      // Check the current face to get the reference and apply the read mask.
+    dxbc::Src z_ddx_src(dxbc::Src::LF(0.0f)), z_ddy_src(dxbc::Src::LF(0.0f));
+
+    if (shader_writes_depth) {
+      // Convert the shader-generated depth to 24-bit, using temp.x as
+      // temporary. oDepth is already written by StoreResult with saturation,
+      // no need to clamp here. Adreno 200 doesn't have PA_SC_VPORT_ZMIN/ZMAX,
+      // so likely there's no need to clamp to the viewport depth bounds.
+      ROV_DepthTo24Bit(system_temp_depth_stencil_, 0, system_temp_depth_stencil_, 0, temp, 0);
+    } else {
+      dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+      // Get the derivatives of the screen-space (but not clamped to the viewport
+      // depth bounds yet - this happens after the pixel shader in Direct3D 11+;
+      // also linear within the triangle - thus constant derivatives along the
+      // triangle) Z for calculating per-sample depth values and the slope-scaled
+      // polygon offset.
+      // We're using derivatives instead of eval_sample_index for various reasons:
+      // - eval_sample_index doesn't work with SV_Position - need to use an
+      //   additional interpolant.
+      // - On AMD, eval_sample_index is actually implemented via calculation and
+      //   scaling of derivatives of barycentric coordinates, therefore there's no
+      //   advantage of using it there.
+      // - eval_sample_index is (inconsistently, but often) one of the sources of
+      //   the infamous AMD shader compiler crashes when ROV is used in Xenia, in
+      //   addition to shader compiler crashes on WARP.
+      if (depth_stencil_early) {
+        z_ddx_src = dxbc::Src::R(temp, dxbc::Src::kXXXX);
+        z_ddy_src = dxbc::Src::R(temp, dxbc::Src::kYYYY);
+        // temp.x = ddx(z)
+        // temp.y = ddy(z)
+        in_position_used_ |= 0b0100;
+        a_.OpDerivRTXCoarse(temp_x_dest, in_position_z);
+        a_.OpDerivRTYCoarse(temp_y_dest, in_position_z);
+      } else {
+        // For late depth / stencil testing, derivatives are calculated in the
+        // beginning of the shader before any return statement is possibly
+        // reached, and written to system_temp_depth_stencil_.xy.
+        assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+        z_ddx_src = dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX);
+        z_ddy_src = dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kYYYY);
+      }
+      // Get the maximum depth slope for polygon offset.
+      // https://docs.microsoft.com/en-us/windows/desktop/direct3d9/depth-bias
+      // temp.x if early = ddx(z)
+      // temp.y if early = ddy(z)
+      // temp.z = max(|ddx(z)|, |ddy(z)|)
+      a_.OpMax(temp_z_dest, z_ddx_src.Abs(), z_ddy_src.Abs());
+      // Calculate the depth bias for the needed faceness.
       in_front_face_used_ = true;
       a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX));
-      for (uint32_t j = 0; j < 2; ++j) {
-        if (j) {
-          // Go to the back face.
-          a_.OpElse();
-        }
-        dxbc::Src stencil_read_mask_src(
-            LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                               j ? offsetof(SystemConstants, edram_stencil_back_read_mask)
-                                 : offsetof(SystemConstants, edram_stencil_front_read_mask),
-                               dxbc::Src::kXXXX));
-        // Read-mask the stencil reference.
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = read-masked stencil reference
-        a_.OpAnd(sample_temp_y_dest,
-                 LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                    j ? offsetof(SystemConstants, edram_stencil_back_reference)
-                                      : offsetof(SystemConstants, edram_stencil_front_reference),
-                                    dxbc::Src::kXXXX),
-                 stencil_read_mask_src);
-        // Read-mask the old stencil value (also dropping the depth bits).
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = read-masked stencil reference
-        // sample_temp.z = read-masked old stencil
-        a_.OpAnd(sample_temp_z_dest, sample_temp_x_src, stencil_read_mask_src);
-      }
-      // Close the face check.
+      // temp.x if early = ddx(z)
+      // temp.y if early = ddy(z)
+      // temp.z = front face polygon offset
+      // temp.w = free
+      a_.OpMAd(
+          temp_z_dest, temp_z_src,
+          LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
+                             offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kXXXX),
+          LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
+                             offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kYYYY));
+      a_.OpElse();
+      // temp.x if early = ddx(z)
+      // temp.y if early = ddy(z)
+      // temp.z = back face polygon offset
+      // temp.w = free
+      a_.OpMAd(
+          temp_z_dest, temp_z_src,
+          LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
+                             offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kXXXX),
+          LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
+                             offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kYYYY));
       a_.OpEndIf();
-      // Get the difference between the stencil reference and the old stencil,
-      // > 0 - greater, == 0 - equal, < 0 - less.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil difference
-      // sample_temp.z = free
-      a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, -sample_temp_z_src);
-      // Check if the stencil is "less" or "greater or equal".
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil difference
-      // sample_temp.z = stencil difference less than 0
-      a_.OpILT(sample_temp_z_dest, sample_temp_y_src, dxbc::Src::LI(0));
-      // Choose the passed depth function bits for "less" or for "greater".
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil difference
-      // sample_temp.z = stencil function passed bits for "less" or "greater"
-      a_.OpMovC(sample_temp_z_dest, sample_temp_z_src,
-                dxbc::Src::LU(uint32_t(xenos::CompareFunction::kLess)),
-                dxbc::Src::LU(uint32_t(xenos::CompareFunction::kGreater)));
-      // Do the "equal" testing.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil function passed bits
-      // sample_temp.z = free
-      a_.OpMovC(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src,
-                dxbc::Src::LU(uint32_t(xenos::CompareFunction::kEqual)));
-      // Get the comparison function and the operations for the current face.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil function passed bits
-      // sample_temp.z = stencil function and operations
-      in_front_face_used_ = true;
-      a_.OpMovC(sample_temp_z_dest,
-                dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
-                LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                   offsetof(SystemConstants, edram_stencil_front_func_ops),
-                                   dxbc::Src::kXXXX),
-                LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                   offsetof(SystemConstants, edram_stencil_back_func_ops),
-                                   dxbc::Src::kXXXX));
-      // Mask the resulting bits with the ones that should pass (the comparison
-      // function is in the low 3 bits of the constant, and only ANDing 3-bit
-      // values with it, so safe not to UBFE the function).
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = stencil test result
-      // sample_temp.z = stencil function and operations
-      a_.OpAnd(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src);
-      // Handle passing and failure of the stencil test, to choose the operation
-      // and to discard the sample.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = free
-      // sample_temp.z = stencil function and operations
-      a_.OpIf(true, sample_temp_y_src);
-      {
-        // Check if depth test has passed for this sample (the sample will only
-        // be processed if it's covered, so the only thing that could unset the
-        // bit at this point that matters is the depth test).
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = depth test result
-        // sample_temp.z = stencil function and operations
-        a_.OpAnd(sample_temp_y_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-                 dxbc::Src::LU(1 << i));
-        // Choose the bit offset of the stencil operation.
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = sample operation offset
-        // sample_temp.z = stencil function and operations
-        a_.OpMovC(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LU(6), dxbc::Src::LU(9));
-        // Extract the stencil operation.
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = stencil operation
-        // sample_temp.z = free
-        a_.OpUBFE(sample_temp_y_dest, dxbc::Src::LU(3), sample_temp_y_src, sample_temp_z_src);
+      // Apply the post-clip and post-viewport polygon offset to the fragment's
+      // depth. Not clamping yet as this is at the center, which is not
+      // necessarily covered and not necessarily inside the bounds - derivatives
+      // scaled by sample positions will be added to this value, and it must be
+      // linear.
+      // temp.x if early = ddx(z)
+      // temp.y if early = ddy(z)
+      // temp.z = biased depth in the center
+      in_position_used_ |= 0b0100;
+      a_.OpAdd(temp_z_dest, temp_z_src, in_position_z);
+    }
+
+    const uint32_t sample_count = ROV_GetSampleCount();
+    for (uint32_t i = 0; i < sample_count; ++i) {
+      // With early depth/stencil, depth/stencil writing may be deferred to the
+      // end of the shader to prevent writing in case something (like alpha test,
+      // which is dynamic GPU state) discards the pixel. So, write directly to the
+      // persistent register, system_temp_depth_stencil_, instead of a local
+      // temporary register.
+      dxbc::Dest sample_depth_stencil_dest(
+          depth_stencil_early ? dxbc::Dest::R(system_temp_depth_stencil_, 1 << i) : temp_w_dest);
+      dxbc::Src sample_depth_stencil_src(
+          depth_stencil_early ? dxbc::Src::R(system_temp_depth_stencil_).Select(i) : temp_w_src);
+
+      // Get if the current sample is covered.
+      // temp.x if no oDepth and early = ddx(z)
+      // temp.y if no oDepth and early = ddy(z)
+      // temp.z if no oDepth = biased depth in the center
+      // temp.w = coverage of the current sample
+      a_.OpAnd(temp_w_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+               dxbc::Src::LU(1 << i));
+      // Check if the current sample is covered.
+      // temp.x if no oDepth and early = ddx(z)
+      // temp.y if no oDepth and early = ddy(z)
+      // temp.z if no oDepth = biased depth in the center
+      // temp.w = free
+      a_.OpIf(true, temp_w_src);
+
+      uint32_t sample_temp = PushSystemTemp();
+      dxbc::Dest sample_temp_x_dest(dxbc::Dest::R(sample_temp, 0b0001));
+      dxbc::Src sample_temp_x_src(dxbc::Src::R(sample_temp, dxbc::Src::kXXXX));
+      dxbc::Dest sample_temp_y_dest(dxbc::Dest::R(sample_temp, 0b0010));
+      dxbc::Src sample_temp_y_src(dxbc::Src::R(sample_temp, dxbc::Src::kYYYY));
+      dxbc::Dest sample_temp_z_dest(dxbc::Dest::R(sample_temp, 0b0100));
+      dxbc::Src sample_temp_z_src(dxbc::Src::R(sample_temp, dxbc::Src::kZZZZ));
+      dxbc::Dest sample_temp_w_dest(dxbc::Dest::R(sample_temp, 0b1000));
+      dxbc::Src sample_temp_w_src(dxbc::Src::R(sample_temp, dxbc::Src::kWWWW));
+
+      if (shader_writes_depth) {
+        // Copy the 24-bit depth common to all samples to sample_depth_stencil.
+        // temp.w = shader-generated 24-bit depth
+        assert_false(depth_stencil_early);
+        a_.OpMov(sample_depth_stencil_dest,
+                 dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX));
+      } else {
+        // Adreno 200 doesn't have PA_SC_VPORT_ZMIN/ZMAX, so likely there's no
+        // need to clamp to the viewport depth bounds, just to 0...1 - thus only
+        // saturating in the end of the per-sample depth calculation.
+        switch (i) {
+          case 0:
+            // First sample - off-center for MSAA, in the center without it.
+            // Using ForcedSampleCount 4 for both 2x and 4x MSAA because
+            // ForcedSampleCount 2 is not supported on Nvidia, thus the position
+            // of the top-left sample (0 in Xenia) is always that of the top-left
+            // sample of host 4x MSAA.
+            // Calculate the depth in the sample 0 for 2x or 4x MSAA.
+            // temp.x if early = ddx(z)
+            // temp.y if early = ddy(z)
+            // temp.z = biased depth in the center
+            // temp.w if late = unsaturated sample 0 depth at 4x MSAA
+            a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
+                     dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[0][0] * (1.0f / 16.0f)),
+                     temp_z_src);
+            a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
+                     dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[0][1] * (1.0f / 16.0f)),
+                     sample_depth_stencil_src);
+            // Choose between the sample and the center depth depending on whether
+            // at least 2x MSAA is enabled and saturate.
+            // temp.x if early = ddx(z)
+            // temp.y if early = ddy(z)
+            // temp.z = biased depth in the center
+            // temp.w if late = sample 0 depth
+            if (ROV_IsSampleCountSpecialized()) {
+              if (ROV_GetSampleCount() == 1) {
+                a_.OpMov(sample_depth_stencil_dest, temp_z_src, true);
+              } else {
+                a_.OpMov(sample_depth_stencil_dest, sample_depth_stencil_src, true);
+              }
+            } else {
+              a_.OpMovC(
+                  sample_depth_stencil_dest,
+                  LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                                     offsetof(SystemConstants, sample_count_log2), dxbc::Src::kYYYY),
+                  sample_depth_stencil_src, temp_z_src, true);
+            }
+            break;
+          case 1: {
+            // - 2x MSAA: Bottom sample -> bottom-right (3) with Direct3D 11's
+            //   ForcedSampleCount 4.
+            // - 4x MSAA: Bottom-left Xenia sample -> Direct3D 11 sample 2.
+            // Check if 4x MSAA is used.
+            auto emit_sample_1_depth = [&](uint32_t host_sample_index) {
+              const int8_t* sample_position =
+                  draw_util::kD3D10StandardSamplePositions4x[host_sample_index];
+              a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
+                       dxbc::Src::LF(sample_position[0] * (1.0f / 16.0f)), temp_z_src);
+              a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
+                       dxbc::Src::LF(sample_position[1] * (1.0f / 16.0f)), sample_depth_stencil_src,
+                       true);
+            };
+            if (ROV_IsSampleCountSpecialized()) {
+              emit_sample_1_depth(ROV_GetSampleCount() == 4 ? 2 : 3);
+            } else {
+              a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                                               offsetof(SystemConstants, sample_count_log2),
+                                               dxbc::Src::kXXXX));
+              emit_sample_1_depth(2);
+              a_.OpElse();
+              emit_sample_1_depth(3);
+              a_.OpEndIf();
+            }
+            break;
+          }
+          default: {
+            // Xenia samples 2 and 3 (top-right and bottom-right) -> Direct3D 11
+            // samples 1 and 3.
+            // temp.x if early = ddx(z)
+            // temp.y if early = ddy(z)
+            // temp.z = biased depth in the center
+            // temp.w if late = saturated sample 2 or 3 depth
+            const int8_t* sample_position =
+                draw_util::kD3D10StandardSamplePositions4x[i ^ (((i & 1) ^ (i >> 1)) * 0b11)];
+            a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
+                     dxbc::Src::LF(sample_position[0] * (1.0f / 16.0f)), temp_z_src);
+            a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
+                     dxbc::Src::LF(sample_position[1] * (1.0f / 16.0f)), sample_depth_stencil_src,
+                     true);
+          } break;
+        }
+        // Convert the sample's depth to 24-bit, using sample_temp.x as a
+        // temporary.
+        // temp.x if early = ddx(z)
+        // temp.y if early = ddy(z)
+        // temp.z = biased depth in the center
+        // temp.w if late = sample's 24-bit Z
+        ROV_DepthTo24Bit(sample_depth_stencil_src.index_1d_.index_,
+                         sample_depth_stencil_src.swizzle_ & 3,
+                         sample_depth_stencil_src.index_1d_.index_,
+                         sample_depth_stencil_src.swizzle_ & 3, sample_temp, 0);
       }
-      // Stencil test has failed.
+
+      // Load the old depth/stencil value.
+      // sample_temp.x = old depth/stencil
+      if (uav_index_edram_ == kBindingIndexUnallocated) {
+        uav_index_edram_ = uav_count_++;
+      }
+      a_.OpLdUAVTyped(
+          sample_temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
+          dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
+
+      // Depth test.
+      const uint32_t depth_profile = GetDxbcShaderModification().pixel.rov_depth_profile;
+
+      // Extract the old depth part to sample_depth_stencil.
+      // sample_temp.x = old depth/stencil
+      // sample_temp.y = old depth
+      a_.OpUShR(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(8));
+      if (depth_profile >= 3) {
+        if (depth_profile == 3) {
+          a_.OpMov(sample_temp_z_dest, dxbc::Src::LU(1));
+        } else {
+          switch ((depth_profile - 4) / 2) {
+            case 0:
+            a_.OpUGE(sample_temp_z_dest, sample_depth_stencil_src, sample_temp_y_src);
+              a_.OpNot(sample_temp_z_dest, sample_temp_z_src);
+              break;
+            case 1:
+              a_.OpIEq(sample_temp_z_dest, sample_depth_stencil_src, sample_temp_y_src);
+              break;
+            case 2:
+              a_.OpUGE(sample_temp_z_dest, sample_temp_y_src, sample_depth_stencil_src);
+              break;
+            case 3:
+            a_.OpUGE(sample_temp_z_dest, sample_temp_y_src, sample_depth_stencil_src);
+              a_.OpNot(sample_temp_z_dest, sample_temp_z_src);
+              break;
+            case 4:
+              a_.OpINE(sample_temp_z_dest, sample_depth_stencil_src, sample_temp_y_src);
+              break;
+            default:
+              a_.OpUGE(sample_temp_z_dest, sample_depth_stencil_src, sample_temp_y_src);
+              break;
+          }
+        }
+      } else {
+        // Get the difference between the new and the old depth, > 0 - greater,
+        // == 0 - equal, < 0 - less.
+        // sample_temp.x = old depth/stencil
+        // sample_temp.y = old depth
+        // sample_temp.z = depth difference
+        a_.OpIAdd(sample_temp_z_dest, sample_depth_stencil_src, -sample_temp_y_src);
+        // Check if the depth is "less" or "greater or equal".
+        // sample_temp.x = old depth/stencil
+        // sample_temp.y = old depth
+        // sample_temp.z = depth difference
+        // sample_temp.w = depth difference less than 0
+        a_.OpILT(sample_temp_w_dest, sample_temp_z_src, dxbc::Src::LI(0));
+        // Choose the passed depth function bits for "less" or for "greater".
+        // sample_temp.x = old depth/stencil
+        // sample_temp.y = old depth
+        // sample_temp.z = depth difference
+        // sample_temp.w = depth function passed bits for "less" or "greater"
+        a_.OpMovC(sample_temp_w_dest, sample_temp_w_src, dxbc::Src::LU(kSysFlag_ROVDepthPassIfLess),
+                  dxbc::Src::LU(kSysFlag_ROVDepthPassIfGreater));
+        // Do the "equal" testing.
+        // sample_temp.x = old depth/stencil
+        // sample_temp.y = old depth
+        // sample_temp.z = depth function passed bits
+        // sample_temp.w = free
+        a_.OpMovC(sample_temp_z_dest, sample_temp_z_src, sample_temp_w_src,
+                  dxbc::Src::LU(kSysFlag_ROVDepthPassIfEqual));
+        // Mask the resulting bits with the ones that should pass.
+        // sample_temp.x = old depth/stencil
+        // sample_temp.y = old depth
+        // sample_temp.z = masked depth function passed bits
+        a_.OpAnd(sample_temp_z_dest, sample_temp_z_src, LoadFlagsSystemConstant());
+      }
+      // Check if depth test has passed.
+      // sample_temp.x = old depth/stencil
+      // sample_temp.y = old depth
+      // sample_temp.z = free
+      a_.OpIf(true, sample_temp_z_src);
+      {
+      if (depth_profile) {
+        if (depth_profile == 3 || (depth_profile >= 4 && (depth_profile & 1))) {
+          a_.OpMov(sample_depth_stencil_dest, sample_depth_stencil_src);
+        }
+        } else {
+          // Extract the depth write flag.
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = old depth
+          // sample_temp.z = depth write mask
+          a_.OpAnd(sample_temp_z_dest, LoadFlagsSystemConstant(),
+                   dxbc::Src::LU(kSysFlag_ROVDepthWrite));
+          // If depth writing is disabled, don't change the depth.
+          // temp.x if no oDepth and early = ddx(z)
+          // temp.y if no oDepth and early = ddy(z)
+          // temp.z if no oDepth = biased depth in the center
+          // temp.w if late = resulting sample depth after the depth test
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = free
+          // sample_temp.z = free
+          a_.OpMovC(sample_depth_stencil_dest, sample_temp_z_src, sample_depth_stencil_src,
+                    sample_temp_y_src);      }
+
+      }
+      // Depth test has failed.
       a_.OpElse();
       {
-        // Extract the stencil fail operation.
-        // sample_temp.x = old depth/stencil
-        // sample_temp.y = stencil operation
-        // sample_temp.z = free
-        a_.OpUBFE(sample_temp_y_dest, dxbc::Src::LU(3), dxbc::Src::LU(3), sample_temp_z_src);
+        if (depth_profile == 3 || (depth_profile >= 4 && (depth_profile & 1))) {
+          a_.OpMov(sample_depth_stencil_dest, sample_temp_y_src);
+        }
         // Exclude the bit from the covered sample mask.
         // sample_temp.x = old depth/stencil
-        // sample_temp.y = stencil operation
+        // sample_temp.y = old depth
         a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
                  dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
                  dxbc::Src::LU(~uint32_t(1 << i)));
       }
-      // Close the stencil pass check.
       a_.OpEndIf();
+      if (!depth_profile || depth_profile == 3 ||
+          (depth_profile >= 4 && (depth_profile & 1))) {
+        // Create packed depth/stencil, with the stencil value unchanged at this
+        // point.
+        // temp.x if no oDepth and early = ddx(z)
+        // temp.y if no oDepth and early = ddy(z)
+        // temp.z if no oDepth = biased depth in the center
+        // temp.w if late = resulting sample depth, current resulting stencil
+        // sample_temp.x = old depth/stencil
+        a_.OpBFI(sample_depth_stencil_dest, dxbc::Src::LU(24), dxbc::Src::LU(8),
+                 sample_depth_stencil_src, sample_temp_x_src);
 
-      // Open the stencil operation switch for writing the new stencil (not
-      // caring about bits 8:31).
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = will contain unmasked new stencil in 0:7 and junk above
-      a_.OpSwitch(sample_temp_y_src);
-      {
-        // Zero.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kZero)));
-        a_.OpMov(sample_temp_y_dest, dxbc::Src::LU(0));
-        a_.OpBreak();
-        // Replace.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kReplace)));
-        in_front_face_used_ = true;
-        a_.OpMovC(sample_temp_y_dest,
-                  dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
+        if (!depth_profile) {
+          // Stencil test.
+
+          // Extract the stencil test bit.
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = stencil test enabled
+          a_.OpAnd(sample_temp_y_dest, LoadFlagsSystemConstant(), dxbc::Src::LU(kSysFlag_ROVStencilTest));
+          // Check if stencil test is enabled.
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = free
+          a_.OpIf(true, sample_temp_y_src);
+          {
+            // Check the current face to get the reference and apply the read mask.
+            in_front_face_used_ = true;
+            a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX));
+            for (uint32_t j = 0; j < 2; ++j) {
+              if (j) {
+                // Go to the back face.
+                a_.OpElse();
+              }
+              dxbc::Src stencil_read_mask_src(
                   LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                     offsetof(SystemConstants, edram_stencil_front_reference),
-                                     dxbc::Src::kXXXX),
-                  LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                     offsetof(SystemConstants, edram_stencil_back_reference),
+                                     j ? offsetof(SystemConstants, edram_stencil_back_read_mask)
+                                       : offsetof(SystemConstants, edram_stencil_front_read_mask),
                                      dxbc::Src::kXXXX));
-        a_.OpBreak();
-        // Increment and clamp.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kIncrementClamp)));
-        {
-          // Clear the upper bits for saturation.
-          a_.OpAnd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(UINT8_MAX));
-          // Increment.
-          a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(1));
-          // Clamp.
-          a_.OpIMin(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(UINT8_MAX));
-        }
-        a_.OpBreak();
-        // Decrement and clamp.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kDecrementClamp)));
-        {
-          // Clear the upper bits for saturation.
-          a_.OpAnd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(UINT8_MAX));
-          // Increment.
-          a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(-1));
-          // Clamp.
-          a_.OpIMax(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(0));
-        }
-        a_.OpBreak();
-        // Invert.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kInvert)));
-        a_.OpNot(sample_temp_y_dest, sample_temp_x_src);
-        a_.OpBreak();
-        // Increment and wrap.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kIncrementWrap)));
-        a_.OpIAdd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LI(1));
-        a_.OpBreak();
-        // Decrement and wrap.
-        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kDecrementWrap)));
-        a_.OpIAdd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LI(-1));
-        a_.OpBreak();
-        // Keep.
-        a_.OpDefault();
-        a_.OpMov(sample_temp_y_dest, sample_temp_x_src);
-        a_.OpBreak();
-      }
-      // Close the new stencil switch.
-      a_.OpEndSwitch();
+              // Read-mask the stencil reference.
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = read-masked stencil reference
+              a_.OpAnd(sample_temp_y_dest,
+                       LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                          j ? offsetof(SystemConstants, edram_stencil_back_reference)
+                                            : offsetof(SystemConstants, edram_stencil_front_reference),
+                                          dxbc::Src::kXXXX),
+                       stencil_read_mask_src);
+              // Read-mask the old stencil value (also dropping the depth bits).
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = read-masked stencil reference
+              // sample_temp.z = read-masked old stencil
+              a_.OpAnd(sample_temp_z_dest, sample_temp_x_src, stencil_read_mask_src);
+            }
+            // Close the face check.
+            a_.OpEndIf();
+            // Get the difference between the stencil reference and the old stencil,
+            // > 0 - greater, == 0 - equal, < 0 - less.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil difference
+            // sample_temp.z = free
+            a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, -sample_temp_z_src);
+            // Check if the stencil is "less" or "greater or equal".
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil difference
+            // sample_temp.z = stencil difference less than 0
+            a_.OpILT(sample_temp_z_dest, sample_temp_y_src, dxbc::Src::LI(0));
+            // Choose the passed depth function bits for "less" or for "greater".
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil difference
+            // sample_temp.z = stencil function passed bits for "less" or "greater"
+            a_.OpMovC(sample_temp_z_dest, sample_temp_z_src,
+                      dxbc::Src::LU(uint32_t(xenos::CompareFunction::kLess)),
+                      dxbc::Src::LU(uint32_t(xenos::CompareFunction::kGreater)));
+            // Do the "equal" testing.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil function passed bits
+            // sample_temp.z = free
+            a_.OpMovC(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src,
+                      dxbc::Src::LU(uint32_t(xenos::CompareFunction::kEqual)));
+            // Get the comparison function and the operations for the current face.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil function passed bits
+            // sample_temp.z = stencil function and operations
+            in_front_face_used_ = true;
+            a_.OpMovC(sample_temp_z_dest,
+                      dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
+                      LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                         offsetof(SystemConstants, edram_stencil_front_func_ops),
+                                         dxbc::Src::kXXXX),
+                      LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                         offsetof(SystemConstants, edram_stencil_back_func_ops),
+                                         dxbc::Src::kXXXX));
+            // Mask the resulting bits with the ones that should pass (the comparison
+            // function is in the low 3 bits of the constant, and only ANDing 3-bit
+            // values with it, so safe not to UBFE the function).
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = stencil test result
+            // sample_temp.z = stencil function and operations
+            a_.OpAnd(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src);
+            // Handle passing and failure of the stencil test, to choose the operation
+            // and to discard the sample.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = free
+            // sample_temp.z = stencil function and operations
+            a_.OpIf(true, sample_temp_y_src);
+            {
+              // Check if depth test has passed for this sample (the sample will only
+              // be processed if it's covered, so the only thing that could unset the
+              // bit at this point that matters is the depth test).
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = depth test result
+              // sample_temp.z = stencil function and operations
+              a_.OpAnd(sample_temp_y_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+                       dxbc::Src::LU(1 << i));
+              // Choose the bit offset of the stencil operation.
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = sample operation offset
+              // sample_temp.z = stencil function and operations
+              a_.OpMovC(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LU(6), dxbc::Src::LU(9));
+              // Extract the stencil operation.
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = stencil operation
+              // sample_temp.z = free
+              a_.OpUBFE(sample_temp_y_dest, dxbc::Src::LU(3), sample_temp_y_src, sample_temp_z_src);
+            }
+            // Stencil test has failed.
+            a_.OpElse();
+            {
+              // Extract the stencil fail operation.
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = stencil operation
+              // sample_temp.z = free
+              a_.OpUBFE(sample_temp_y_dest, dxbc::Src::LU(3), dxbc::Src::LU(3), sample_temp_z_src);
+              // Exclude the bit from the covered sample mask.
+              // sample_temp.x = old depth/stencil
+              // sample_temp.y = stencil operation
+              a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
+                       dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+                       dxbc::Src::LU(~uint32_t(1 << i)));
+            }
+            // Close the stencil pass check.
+            a_.OpEndIf();
 
-      // Select the stencil write mask for the face.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = unmasked new stencil in 0:7 and junk above
-      // sample_temp.z = stencil write mask
-      in_front_face_used_ = true;
-      a_.OpMovC(sample_temp_z_dest,
-                dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
-                LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                   offsetof(SystemConstants, edram_stencil_front_write_mask),
-                                   dxbc::Src::kXXXX),
-                LoadSystemConstant(SystemConstants::Index::kEdramStencil,
-                                   offsetof(SystemConstants, edram_stencil_back_write_mask),
-                                   dxbc::Src::kXXXX));
-      // Apply the write mask to the new stencil, also dropping the upper 24
-      // bits.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = masked new stencil
-      // sample_temp.z = stencil write mask
-      a_.OpAnd(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src);
-      // Invert the write mask for keeping the old stencil and the depth bits.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = masked new stencil
-      // sample_temp.z = inverted stencil write mask
-      a_.OpNot(sample_temp_z_dest, sample_temp_z_src);
-      // Remove the bits that will be replaced from the combined depth/stencil
-      // before inserting their new values.
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = masked new stencil
-      // sample_temp.z = free
-      // temp.x if no oDepth and early = ddx(z)
-      // temp.y if no oDepth and early = ddy(z)
-      // temp.z if no oDepth = biased depth in the center
-      // temp.w if late = resulting sample depth, inverse-write-masked old
-      //                  stencil
-      a_.OpAnd(sample_depth_stencil_dest, sample_depth_stencil_src, sample_temp_z_src);
-      // Merge the old and the new stencil.
-      // temp.x if no oDepth and early = ddx(z)
-      // temp.y if no oDepth and early = ddy(z)
-      // temp.z if no oDepth = biased depth in the center
-      // temp.w if late = resulting sample depth/stencil
-      // sample_temp.x = old depth/stencil
-      // sample_temp.y = free
-      a_.OpOr(sample_depth_stencil_dest, sample_depth_stencil_src, sample_temp_y_src);
-    }
-    // Close the stencil test check.
-    a_.OpEndIf();
+            // Open the stencil operation switch for writing the new stencil (not
+            // caring about bits 8:31).
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = will contain unmasked new stencil in 0:7 and junk above
+            a_.OpSwitch(sample_temp_y_src);
+            {
+              // Zero.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kZero)));
+              a_.OpMov(sample_temp_y_dest, dxbc::Src::LU(0));
+              a_.OpBreak();
+              // Replace.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kReplace)));
+              in_front_face_used_ = true;
+              a_.OpMovC(sample_temp_y_dest,
+                        dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
+                        LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                           offsetof(SystemConstants, edram_stencil_front_reference),
+                                           dxbc::Src::kXXXX),
+                        LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                           offsetof(SystemConstants, edram_stencil_back_reference),
+                                           dxbc::Src::kXXXX));
+              a_.OpBreak();
+              // Increment and clamp.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kIncrementClamp)));
+              {
+                // Clear the upper bits for saturation.
+                a_.OpAnd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(UINT8_MAX));
+                // Increment.
+                a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(1));
+                // Clamp.
+                a_.OpIMin(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(UINT8_MAX));
+              }
+              a_.OpBreak();
+              // Decrement and clamp.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kDecrementClamp)));
+              {
+                // Clear the upper bits for saturation.
+                a_.OpAnd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LU(UINT8_MAX));
+                // Increment.
+                a_.OpIAdd(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(-1));
+                // Clamp.
+                a_.OpIMax(sample_temp_y_dest, sample_temp_y_src, dxbc::Src::LI(0));
+              }
+              a_.OpBreak();
+              // Invert.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kInvert)));
+              a_.OpNot(sample_temp_y_dest, sample_temp_x_src);
+              a_.OpBreak();
+              // Increment and wrap.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kIncrementWrap)));
+              a_.OpIAdd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LI(1));
+              a_.OpBreak();
+              // Decrement and wrap.
+              a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kDecrementWrap)));
+              a_.OpIAdd(sample_temp_y_dest, sample_temp_x_src, dxbc::Src::LI(-1));
+              a_.OpBreak();
+              // Keep.
+              a_.OpDefault();
+              a_.OpMov(sample_temp_y_dest, sample_temp_x_src);
+              a_.OpBreak();
+            }
+            // Close the new stencil switch.
+            a_.OpEndSwitch();
 
-    // Check if the depth/stencil has failed not to modify the depth if it has.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = whether depth/stencil has passed for this sample
-    a_.OpAnd(sample_temp_y_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-             dxbc::Src::LU(1 << i));
-    // If the depth/stencil test has failed, don't change the depth.
-    // sample_temp.x = old depth/stencil
-    // sample_temp.y = free
-    a_.OpIf(false, sample_temp_y_src);
-    {
-      // Copy the new stencil over the old depth.
-      // temp.x if no oDepth and early = ddx(z)
-      // temp.y if no oDepth and early = ddy(z)
-      // temp.z if no oDepth = biased depth in the center
-      // temp.w if late = resulting sample depth/stencil
-      a_.OpBFI(sample_depth_stencil_dest, dxbc::Src::LU(8), dxbc::Src::LU(0),
-               sample_depth_stencil_src, sample_temp_x_src);
-    }
-    // Close the depth/stencil passing check.
-    a_.OpEndIf();
-    // Check if the new depth/stencil is different, and thus needs to be
-    // written.
-    // sample_temp.x = old depth/stencil
-    a_.OpINE(sample_temp_x_dest, sample_depth_stencil_src, sample_temp_x_src);
-    if (depth_stencil_early && !current_shader().implicit_early_z_write_allowed()) {
-      // Set the sample bit in bits 4:7 of system_temp_rov_params_.x - always
-      // need to write late in this shader, as it may do something like
-      // explicitly killing pixels.
-      a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(1),
-               dxbc::Src::LU(4 + i), sample_temp_x_src,
-               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX));
-    } else {
-      // Check if need to write.
-      // sample_temp.x = free
-      a_.OpIf(true, sample_temp_x_src);
-      {
-        if (depth_stencil_early) {
-          // Get if early depth/stencil write is enabled.
-          // sample_temp.x = whether early depth/stencil write is enabled
-          a_.OpAnd(sample_temp_x_dest, LoadFlagsSystemConstant(),
-                   dxbc::Src::LU(kSysFlag_ROVDepthStencilEarlyWrite));
-          // Check if need to write early.
-          // sample_temp.x = free
-          a_.OpIf(true, sample_temp_x_src);
-        }
-        // Write the new depth/stencil.
-        if (uav_index_edram_ == kBindingIndexUnallocated) {
-          uav_index_edram_ = uav_count_++;
-        }
-        a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
-                           dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
-                           sample_depth_stencil_src);
-        if (depth_stencil_early) {
-          // Need to still run the shader to know whether to write the
-          // depth/stencil value.
-          a_.OpElse();
-          // Set the sample bit in bits 4:7 of system_temp_rov_params_.x if need
-          // to write later (after checking if the sample is not discarded by a
-          // kill instruction, alphatest or alpha-to-coverage).
-          a_.OpOr(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
-                  dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-                  dxbc::Src::LU(1 << (4 + i)));
-          // Close the early depth/stencil check.
+            // Select the stencil write mask for the face.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = unmasked new stencil in 0:7 and junk above
+            // sample_temp.z = stencil write mask
+            in_front_face_used_ = true;
+            a_.OpMovC(sample_temp_z_dest,
+                      dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX),
+                      LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                         offsetof(SystemConstants, edram_stencil_front_write_mask),
+                                         dxbc::Src::kXXXX),
+                      LoadSystemConstant(SystemConstants::Index::kEdramStencil,
+                                         offsetof(SystemConstants, edram_stencil_back_write_mask),
+                                         dxbc::Src::kXXXX));
+            // Apply the write mask to the new stencil, also dropping the upper 24
+            // bits.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = masked new stencil
+            // sample_temp.z = stencil write mask
+            a_.OpAnd(sample_temp_y_dest, sample_temp_y_src, sample_temp_z_src);
+            // Invert the write mask for keeping the old stencil and the depth bits.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = masked new stencil
+            // sample_temp.z = inverted stencil write mask
+            a_.OpNot(sample_temp_z_dest, sample_temp_z_src);
+            // Remove the bits that will be replaced from the combined depth/stencil
+            // before inserting their new values.
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = masked new stencil
+            // sample_temp.z = free
+            // temp.x if no oDepth and early = ddx(z)
+            // temp.y if no oDepth and early = ddy(z)
+            // temp.z if no oDepth = biased depth in the center
+            // temp.w if late = resulting sample depth, inverse-write-masked old
+            //                  stencil
+            a_.OpAnd(sample_depth_stencil_dest, sample_depth_stencil_src, sample_temp_z_src);
+            // Merge the old and the new stencil.
+            // temp.x if no oDepth and early = ddx(z)
+            // temp.y if no oDepth and early = ddy(z)
+            // temp.z if no oDepth = biased depth in the center
+            // temp.w if late = resulting sample depth/stencil
+            // sample_temp.x = old depth/stencil
+            // sample_temp.y = free
+            a_.OpOr(sample_depth_stencil_dest, sample_depth_stencil_src, sample_temp_y_src);
+          }
+          // Close the stencil test check.
+          a_.OpEndIf();
+
+          // Check if the depth/stencil has failed not to modify the depth if it has.
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = whether depth/stencil has passed for this sample
+          a_.OpAnd(sample_temp_y_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+                   dxbc::Src::LU(1 << i));
+          // If the depth/stencil test has failed, don't change the depth.
+          // sample_temp.x = old depth/stencil
+          // sample_temp.y = free
+          a_.OpIf(false, sample_temp_y_src);
+          {
+            // Copy the new stencil over the old depth.
+            // temp.x if no oDepth and early = ddx(z)
+            // temp.y if no oDepth and early = ddy(z)
+            // temp.z if no oDepth = biased depth in the center
+            // temp.w if late = resulting sample depth/stencil
+            a_.OpBFI(sample_depth_stencil_dest, dxbc::Src::LU(8), dxbc::Src::LU(0),
+                     sample_depth_stencil_src, sample_temp_x_src);
+          }
+          // Close the depth/stencil passing check.
           a_.OpEndIf();
         }
+
+        // Check if the new depth/stencil is different, and thus needs to be
+        // written.
+        // sample_temp.x = old depth/stencil
+        a_.OpINE(sample_temp_x_dest, sample_depth_stencil_src, sample_temp_x_src);
+        if (depth_stencil_early && !current_shader().implicit_early_z_write_allowed()) {
+          // Set the sample bit in bits 4:7 of system_temp_rov_params_.x - always
+          // need to write late in this shader, as it may do something like
+          // explicitly killing pixels.
+          a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(1),
+                   dxbc::Src::LU(4 + i), sample_temp_x_src,
+                   dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX));
+        } else {
+          // Check if need to write.
+          // sample_temp.x = free
+          a_.OpIf(true, sample_temp_x_src);
+          {
+            if (depth_stencil_early) {
+              // Get if early depth/stencil write is enabled.
+              // sample_temp.x = whether early depth/stencil write is enabled
+              a_.OpAnd(sample_temp_x_dest, LoadFlagsSystemConstant(),
+                       dxbc::Src::LU(kSysFlag_ROVDepthStencilEarlyWrite));
+              // Check if need to write early.
+              // sample_temp.x = free
+              a_.OpIf(true, sample_temp_x_src);
+            }
+            // Write the new depth/stencil.
+            if (uav_index_edram_ == kBindingIndexUnallocated) {
+              uav_index_edram_ = uav_count_++;
+            }
+            a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
+                               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
+                               sample_depth_stencil_src);
+            if (depth_stencil_early) {
+              // Need to still run the shader to know whether to write the
+              // depth/stencil value.
+              a_.OpElse();
+              // Set the sample bit in bits 4:7 of system_temp_rov_params_.x if need
+              // to write later (after checking if the sample is not discarded by a
+              // kill instruction, alphatest or alpha-to-coverage).
+              a_.OpOr(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
+                      dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+                      dxbc::Src::LU(1 << (4 + i)));
+              // Close the early depth/stencil check.
+              a_.OpEndIf();
+            }
+          }
+          // Close the write check.
+          a_.OpEndIf();
+        }
+
       }
-      // Close the write check.
+
+      // Release sample_temp.
+      PopSystemTemp();
+
+      // Close the sample conditional.
       a_.OpEndIf();
+
+      // Samples are at +0, +(80*scale_x), +1, +(80*scale_x+1).
+      // Restore sample 0 after the final tested sample, including for the
+      // shortened 1x/2x variants: deferred depth writes start at that address.
+      const uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      const uint32_t next_sample = i + 1 < sample_count ? i + 1 : 0;
+      const int32_t address_delta =
+          int32_t((next_sample & 1) * tile_width + (next_sample >> 1)) -
+          int32_t((i & 1) * tile_width + (i >> 1));
+      if (address_delta) {
+        a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                  dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                  dxbc::Src::LI(address_delta));
+      }
     }
 
-    // Release sample_temp.
-    PopSystemTemp();
-
-    // Close the sample conditional.
-    a_.OpEndIf();
-
-    // Go to the next sample (samples are at +0, +(80*scale_x), +1,
-    // +(80*scale_x+1), so need to do +(80*scale_x), -(80*scale_x-1),
-    // +(80*scale_x) and -(80*scale_x+1) after each sample).
-    uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
-    a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-              dxbc::Src::LI((i & 1) ? -int32_t(tile_width) + 2 - i : int32_t(tile_width)));
   }
 
   if (ROV_IsDepthStencilEarly()) {
@@ -1051,8 +1144,10 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     a_.OpRetC(false, dxbc::Src::R(temp, dxbc::Src::kXXXX));
   }
 
-  // Close the large depth/stencil conditional.
-  a_.OpEndIf();
+  // Disabled and Never profiles don't open the runtime depth/stencil check.
+  if (depth_profile != 1 && depth_profile != 2) {
+    a_.OpEndIf();
+  }
 
   // Release temp.
   PopSystemTemp();
@@ -1075,6 +1170,15 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // k_32_32_FLOAT handled with the same default label), and if packed_temp is
   // the same as color_temp, the packed color won't be touched.
   a_.OpMov(dxbc::Dest::R(color_temp, 0b1100), dxbc::Src::LF(0.0f, 0.0f, 0.0f, 1.0f));
+
+  if (ROV_IsRGBA8TargetSpecialized(rt_index)) {
+    a_.OpUBFE(dxbc::Dest::R(color_temp), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+              packed_temp_low);
+    a_.OpUToF(dxbc::Dest::R(color_temp), dxbc::Src::R(color_temp));
+    a_.OpMul(dxbc::Dest::R(color_temp), dxbc::Src::R(color_temp),
+             dxbc::Src::LF(1.0f / 255.0f));
+    return;
+  }
 
   // Choose the packing based on the render target's format.
   a_.OpSwitch(LoadSystemConstant(
@@ -1220,6 +1324,19 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
 
   // Break register dependency after 32bpp cases.
   a_.OpMov(dxbc::Dest::R(packed_temp, 1 << (packed_temp_components + 1)), dxbc::Src::LU(0));
+
+  if (ROV_IsRGBA8TargetSpecialized(rt_index)) {
+    for (uint32_t component = 0; component < 4; ++component) {
+      a_.OpMAd(temp1_dest, dxbc::Src::R(color_temp).Select(component), dxbc::Src::LF(255.0f),
+               dxbc::Src::LF(0.5f));
+      a_.OpFToU(component ? temp1_dest : packed_dest_low, temp1_src);
+      if (component) {
+        a_.OpBFI(packed_dest_low, dxbc::Src::LU(8), dxbc::Src::LU(component * 8), temp1_src,
+                 packed_src_low);
+      }
+    }
+    return;
+  }
 
   // Choose the packing based on the render target's format.
   a_.OpSwitch(LoadSystemConstant(
@@ -1751,46 +1868,69 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
   uint32_t coverage_temp = edram_rov_used_ ? system_temp_rov_params_ : temp;
   uint32_t coverage_temp_component = edram_rov_used_ ? 0 : 2;
 
-  // Check if MSAA is enabled.
-  a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                                   offsetof(SystemConstants, sample_count_log2), dxbc::Src::kYYYY));
-  {
-    // Check if MSAA is 4x or 2x.
+  if (ROV_IsSampleCountSpecialized()) {
+    const uint32_t sample_count = ROV_GetSampleCount();
+    if (sample_count == 4) {
+      CompletePixelShader_AlphaToMaskSample(true, 0, 0.75f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 1, 0.25f, temp_x_src, 1.0f / 16.0f,
+                                            coverage_temp, coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 2, 0.5f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 3, 1.0f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+    } else if (sample_count == 2) {
+      CompletePixelShader_AlphaToMaskSample(true, 0, 0.5f, temp_x_src, 1.0f / 8.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 1, 1.0f, temp_x_src, 1.0f / 8.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+    } else {
+      CompletePixelShader_AlphaToMaskSample(true, 0, 1.0f, temp_x_src, 1.0f / 4.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+    }
+  } else {
+    // Check if MSAA is enabled.
     a_.OpIf(true,
             LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                               offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
-    // 4x MSAA.
-    // Sample 0 must be checked first - CompletePixelShader_AlphaToMaskSample
-    // initializes the result for sample index 0.
-    CompletePixelShader_AlphaToMaskSample(true, 0, 0.75f, temp_x_src, 1.0f / 16.0f, coverage_temp,
-                                          coverage_temp_component, temp, 1);
-    CompletePixelShader_AlphaToMaskSample(false, 1, 0.25f, temp_x_src, 1.0f / 16.0f, coverage_temp,
-                                          coverage_temp_component, temp, 1);
-    CompletePixelShader_AlphaToMaskSample(false, 2, 0.5f, temp_x_src, 1.0f / 16.0f, coverage_temp,
-                                          coverage_temp_component, temp, 1);
-    CompletePixelShader_AlphaToMaskSample(false, 3, 1.0f, temp_x_src, 1.0f / 16.0f, coverage_temp,
-                                          coverage_temp_component, temp, 1);
-    // 2x MSAA.
-    // With ROV, using guest sample indices.
-    // Without ROV:
-    // - Native 2x: top (0 in Xenia) is 1 in D3D10.1+, bottom (1 in Xenia) is 0.
-    // - 2x as 4x: top is 0, bottom is 3.
+                               offsetof(SystemConstants, sample_count_log2), dxbc::Src::kYYYY));
+    {
+      // Check if MSAA is 4x or 2x.
+      a_.OpIf(true,
+              LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                                 offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
+      // 4x MSAA.
+      // Sample 0 must be checked first - CompletePixelShader_AlphaToMaskSample
+      // initializes the result for sample index 0.
+      CompletePixelShader_AlphaToMaskSample(true, 0, 0.75f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 1, 0.25f, temp_x_src, 1.0f / 16.0f,
+                                            coverage_temp, coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 2, 0.5f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(false, 3, 1.0f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      // 2x MSAA.
+      // With ROV, using guest sample indices.
+      // Without ROV:
+      // - Native 2x: top (0 in Xenia) is 1 in D3D10.1+, bottom (1 in Xenia) is 0.
+      // - 2x as 4x: top is 0, bottom is 3.
+      a_.OpElse();
+      CompletePixelShader_AlphaToMaskSample(true, (!edram_rov_used_ && msaa_2x_supported_) ? 1 : 0,
+                                            0.5f, temp_x_src, 1.0f / 8.0f, coverage_temp,
+                                            coverage_temp_component, temp, 1);
+      CompletePixelShader_AlphaToMaskSample(
+          false, edram_rov_used_ ? 1 : (msaa_2x_supported_ ? 0 : 3), 1.0f, temp_x_src, 1.0f / 8.0f,
+          coverage_temp, coverage_temp_component, temp, 1);
+      // Close the 4x check.
+      a_.OpEndIf();
+    }
+    // MSAA is disabled.
     a_.OpElse();
-    CompletePixelShader_AlphaToMaskSample(true, (!edram_rov_used_ && msaa_2x_supported_) ? 1 : 0,
-                                          0.5f, temp_x_src, 1.0f / 8.0f, coverage_temp,
+    CompletePixelShader_AlphaToMaskSample(true, 0, 1.0f, temp_x_src, 1.0f / 4.0f, coverage_temp,
                                           coverage_temp_component, temp, 1);
-    CompletePixelShader_AlphaToMaskSample(false, edram_rov_used_ ? 1 : (msaa_2x_supported_ ? 0 : 3),
-                                          1.0f, temp_x_src, 1.0f / 8.0f, coverage_temp,
-                                          coverage_temp_component, temp, 1);
-    // Close the 4x check.
+    // Close the 2x/4x check.
     a_.OpEndIf();
   }
-  // MSAA is disabled.
-  a_.OpElse();
-  CompletePixelShader_AlphaToMaskSample(true, 0, 1.0f, temp_x_src, 1.0f / 4.0f, coverage_temp,
-                                        coverage_temp_component, temp, 1);
-  // Close the 2x/4x check.
-  a_.OpEndIf();
 
   // Check if any sample is still covered and return to avoid unneeded work (the
   // driver's shader compiler may place return after a discard, but it will
@@ -1801,8 +1941,10 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
     // which passed alpha to coverage, but not stencil test, and the stencil
     // buffer needs to be modified - in this case, samples would be dropped in
     // 0:3, but not in 4:7).
-    a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-             dxbc::Src::LU(0b11111111));
+    a_.OpAnd(
+        temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+        dxbc::Src::LU(ROV_IsSampleCountSpecialized() ? (((1u << ROV_GetSampleCount()) - 1) * 0x11u)
+                                                     : 0b11111111));
     a_.OpRetC(false, temp_x_src);
   } else {
     dxbc::Src coverage_src(dxbc::Src::R(coverage_temp, coverage_temp_component));
@@ -1818,6 +1960,9 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
 }
 
 void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
+  const uint32_t depth_profile = GetDxbcShaderModification().pixel.rov_depth_profile;
+  const bool has_depth_write_profile =
+      !depth_profile || depth_profile == 3 || (depth_profile >= 4 && (depth_profile & 1));
   uint32_t temp = PushSystemTemp();
   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
   dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
@@ -1833,8 +1978,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   // Do late depth/stencil test (which includes writing) if needed or deferred
   // depth writing.
   if (ROV_IsDepthStencilEarly()) {
+    if (has_depth_write_profile) {
     // Write modified depth/stencil.
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < ROV_GetSampleCount(); ++i) {
       // Get if need to write to temp.x.
       // temp.x = whether the depth sample needs to be written.
       a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
@@ -1856,13 +2002,14 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Go to the next sample (samples are at +0, +(80*scale_x), +1,
       // +(80*scale_x+1), so need to do +(80*scale_x), -(80*scale_x-1),
       // +(80*scale_x) and -(80*scale_x+1) after each sample).
-      if (i < 3) {
+      if (i + 1 < ROV_GetSampleCount()) {
         a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
                   dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
                   dxbc::Src::LI((i & 1) ? -int32_t(tile_width) + 2 - i : int32_t(tile_width)));
       }
     }
-  } else {
+    }
+  } else if (depth_profile != 1) {
     ROV_DepthStencilTest();
   }
 
@@ -1874,7 +2021,8 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     // skip color writing completely in this case.
     // temp.x = whether any sample is still covered.
     a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-             dxbc::Src::LU(0b1111));
+             dxbc::Src::LU(ROV_IsSampleCountSpecialized() ? ((1u << ROV_GetSampleCount()) - 1)
+                                                          : 0b1111));
     // temp.x = free.
     a_.OpRetC(false, temp_x_src);
   }
@@ -1890,29 +2038,30 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
 
     // This includes a swizzle to choose XY for even render targets or ZW for
     // odd ones - use SelectFromSwizzled and SwizzleSwizzled.
-    dxbc::Src keep_mask_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTKeepMask,
-        offsetof(SystemConstants, edram_rt_keep_mask) + sizeof(uint32_t) * 2 * i, 0b0100));
+    dxbc::Src keep_mask_src(dxbc::Src::LU(0));
+    if (!GetDxbcShaderModification().pixel.rov_full_write) {
+      keep_mask_src = LoadSystemConstant(
+          SystemConstants::Index::kEdramRTKeepMask,
+          offsetof(SystemConstants, edram_rt_keep_mask) + sizeof(uint32_t) * 2 * i, 0b0100);
+    }
 
     // Check if color writing is disabled - special keep mask constant case,
     // both 32bpp parts are forced UINT32_MAX, but also check whether the shader
     // has written anything to this target at all.
 
-    // Combine both parts of the keep mask to check if both are 0xFFFFFFFF.
-    // temp.x = whether all bits need to be kept.
-    a_.OpAnd(temp_x_dest, keep_mask_src.SelectFromSwizzled(0), keep_mask_src.SelectFromSwizzled(1));
-    // Flip the bits so both UINT32_MAX would result in 0 - not writing.
-    // temp.x = whether any bits need to be written.
-    a_.OpNot(temp_x_dest, temp_x_src);
-    // Get the bits that will be used for checking wherther the render target
-    // has been written to on the taken execution path - if the write mask is
-    // empty, AND zero with the test bit to always get zero.
-    // temp.x = bits for checking whether the render target has been written to.
-    a_.OpMovC(temp_x_dest, temp_x_src, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
-              dxbc::Src::LU(0));
-    // Check if the render target was written to on the execution path.
-    // temp.x = whether anything was written and needs to be stored.
-    a_.OpAnd(temp_x_dest, temp_x_src, dxbc::Src::LU(1 << (8 + i)));
+    if (GetDxbcShaderModification().pixel.rov_full_write) {
+      a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+               dxbc::Src::LU(1 << (8 + i)));
+    } else {
+      // Only write if this target has a non-empty packed write mask and was
+      // exported on the taken execution path.
+      a_.OpAnd(temp_x_dest, keep_mask_src.SelectFromSwizzled(0),
+               keep_mask_src.SelectFromSwizzled(1));
+      a_.OpNot(temp_x_dest, temp_x_src);
+      a_.OpMovC(temp_x_dest, temp_x_src, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+                dxbc::Src::LU(0));
+      a_.OpAnd(temp_x_dest, temp_x_src, dxbc::Src::LU(1 << (8 + i)));
+    }
     // Check if need to write anything to the render target.
     // temp.x = free.
     a_.OpIf(true, temp_x_src);
@@ -1924,20 +2073,28 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                 dxbc::Src::kXXXX));
 
-    dxbc::Src rt_format_flags_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTFormatFlags,
-        offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i, dxbc::Src::kXXXX));
+    const uint32_t blend_profile = GetDxbcShaderModification().pixel.rov_blend_profile;
+    dxbc::Src rt_format_flags_src(dxbc::Src::LU(0));
+    if (!ROV_IsRGBA8TargetSpecialized(i) ||
+        (!GetDxbcShaderModification().pixel.rov_no_blend && !blend_profile)) {
+      rt_format_flags_src = LoadSystemConstant(
+          SystemConstants::Index::kEdramRTFormatFlags,
+          offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i,
+          dxbc::Src::kXXXX);
+    }
 
-    // Load whether the render target is 64bpp to system_temp_rov_params_.y to
-    // get the needed relative sample address.
-    a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0010), rt_format_flags_src,
-             dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
-    // Choose the relative sample address for the render target to
-    // system_temp_rov_params_.y.
-    a_.OpMovC(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ));
+    if (ROV_IsRGBA8TargetSpecialized(i)) {
+      a_.OpMov(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ));
+    } else {
+      // Select the 32bpp or 64bpp sample address for this target.
+      a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0010), rt_format_flags_src,
+               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+      a_.OpMovC(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ));
+    }
     // Add the EDRAM base of the render target to system_temp_rov_params_.y.
     a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
@@ -1951,20 +2108,19 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
               dxbc::Src::LU(edram_size_32bpp_samples));
 
-    dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTBlendFactorsOps,
-        offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
-        dxbc::Src::kXXXX));
+    dxbc::Src rt_blend_factors_ops_src(dxbc::Src::LU(0));
+    if (!GetDxbcShaderModification().pixel.rov_no_blend && !blend_profile) {
+      rt_blend_factors_ops_src = LoadSystemConstant(
+          SystemConstants::Index::kEdramRTBlendFactorsOps,
+          offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
+          dxbc::Src::kXXXX);
+    }
     dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
         SystemConstants::Index::kEdramRTClamp,
         offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
-    // Get if not blending to pack the color once for all 4 samples.
-    // temp.x = whether blending is disabled.
-    a_.OpIEq(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(0x00010001));
-    // Check if not blending.
-    // temp.x = free.
-    a_.OpIf(true, temp_x_src);
-    {
+    if (GetDxbcShaderModification().pixel.rov_no_blend) {
+      // The pipeline key proves that all color targets written by this shader
+      // use source-only blending, so omit the general blend path entirely.
       // Clamp the color to the render target's representable range - will be
       // packed.
       a_.OpMax(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
@@ -1974,53 +2130,96 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Pack the color once if blending.
       // temp.xy = packed color.
       ROV_PackPreClampedColor(i, system_temps_color_[i], temp, 0, temp, 2, temp, 3);
-    }
-    // Blending is enabled.
-    a_.OpElse();
-    {
-      // Get if the blending source color is fixed-point for clamping if it is.
-      // temp.x = whether color is fixed-point.
-      a_.OpAnd(temp_x_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
-      // Check if the blending source color is fixed-point and needs clamping.
-      // temp.x = free.
-      a_.OpIf(true, temp_x_src);
-      {
-        // Clamp the blending source color if needed.
-        a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b0111),
-                 dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(0));
-        a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b0111),
-                 dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(2));
-      }
-      // Close the fixed-point color check.
-      a_.OpEndIf();
-
-      // Get if the blending source alpha is fixed-point for clamping if it is.
-      // temp.x = whether alpha is fixed-point.
-      a_.OpAnd(temp_x_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
-      // Check if the blending source alpha is fixed-point and needs clamping.
-      // temp.x = free.
-      a_.OpIf(true, temp_x_src);
-      {
-        // Clamp the blending source alpha if needed.
-        a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b1000),
-                 dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                 rt_clamp_vec_src.Select(1));
-        a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b1000),
-                 dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                 rt_clamp_vec_src.Select(3));
-      }
-      // Close the fixed-point alpha check.
-      a_.OpEndIf();
-      // Break register dependency in the color sample raster operation.
-      // temp.xy = 0 instead of packed color.
+    } else if (GetDxbcShaderModification().pixel.rov_blend_profile) {
+      a_.OpMax(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+               rt_clamp_vec_src.Swizzle(0b01000000));
+      a_.OpMin(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+               rt_clamp_vec_src.Swizzle(0b11101010));
       a_.OpMov(dxbc::Dest::R(temp, 0b0011), dxbc::Src::LU(0));
+    } else {
+      // Get if not blending to pack the color once for all 4 samples.
+      // temp.x = whether blending is disabled.
+      a_.OpIEq(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(0x00010001));
+      // Check if not blending.
+      // temp.x = free.
+      a_.OpIf(true, temp_x_src);
+      {
+        // Clamp the color to the render target's representable range - will be
+        // packed.
+        a_.OpMax(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+                 rt_clamp_vec_src.Swizzle(0b01000000));
+        a_.OpMin(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+                 rt_clamp_vec_src.Swizzle(0b11101010));
+        // Pack the color once if blending.
+        // temp.xy = packed color.
+        ROV_PackPreClampedColor(i, system_temps_color_[i], temp, 0, temp, 2, temp, 3);
+      }
+      // Blending is enabled.
+      a_.OpElse();
+      {
+        // Get if the blending source color is fixed-point for clamping if it is.
+        // temp.x = whether color is fixed-point.
+        a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+        // Check if the blending source color is fixed-point and needs clamping.
+        // temp.x = free.
+        a_.OpIf(true, temp_x_src);
+        {
+          // Clamp the blending source color if needed.
+          a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b0111),
+                   dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(0));
+          a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b0111),
+                   dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(2));
+        }
+        // Close the fixed-point color check.
+        a_.OpEndIf();
+
+        // Get if the blending source alpha is fixed-point for clamping if it is.
+        // temp.x = whether alpha is fixed-point.
+        a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+        // Check if the blending source alpha is fixed-point and needs clamping.
+        // temp.x = free.
+        a_.OpIf(true, temp_x_src);
+        {
+          // Clamp the blending source alpha if needed.
+          a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b1000),
+                   dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                   rt_clamp_vec_src.Select(1));
+          a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b1000),
+                   dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                   rt_clamp_vec_src.Select(3));
+        }
+        // Close the fixed-point alpha check.
+        a_.OpEndIf();
+        // Break register dependency in the color sample raster operation.
+        // temp.xy = 0 instead of packed color.
+        a_.OpMov(dxbc::Dest::R(temp, 0b0011), dxbc::Src::LU(0));
+      }
+      a_.OpEndIf();
     }
-    a_.OpEndIf();
+
+    uint32_t blend_src_temp = UINT32_MAX;
+    if (blend_profile) {
+      blend_src_temp = PushSystemTemp();
+      dxbc::Dest blend_src_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
+      dxbc::Src blend_src_rgb(dxbc::Src::R(blend_src_temp));
+      dxbc::Dest blend_src_alpha_dest(dxbc::Dest::R(blend_src_temp, 0b1000));
+
+      if (blend_profile == 1) {
+        a_.OpMul(blend_src_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
+                 dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW));
+      } else {
+        a_.OpMov(blend_src_rgb_dest, dxbc::Src::R(system_temps_color_[i]));
+      }
+      a_.OpMax(blend_src_rgb_dest, blend_src_rgb, rt_clamp_vec_src.Select(0));
+      a_.OpMin(blend_src_rgb_dest, blend_src_rgb, rt_clamp_vec_src.Select(2));
+      a_.OpMov(blend_src_alpha_dest,
+               dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW));
+    }
 
     // Blend, mask and write all samples.
-    for (uint32_t j = 0; j < 4; ++j) {
+    for (uint32_t j = 0; j < ROV_GetSampleCount(); ++j) {
       // Get if the sample is covered.
       // temp.z = whether the sample is covered.
       a_.OpAnd(temp_z_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
@@ -2042,511 +2241,566 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // kept or if blending is enabled.
       // ***********************************************************************
 
-      // Get if need to keep any components to temp.z.
-      // temp.z = whether any components must be kept (OR of keep masks).
-      a_.OpOr(temp_z_dest, keep_mask_src.SelectFromSwizzled(0),
-              keep_mask_src.SelectFromSwizzled(1));
-      // Blending isn't done if it's 1 * source + 0 * destination. But since the
-      // previous color also needs to be loaded if any original components need
-      // to be kept, force the blend control to something with blending in this
-      // case in temp.z.
-      // temp.z = blending mode used to check if need to load.
-      a_.OpMovC(temp_z_dest, temp_z_src, dxbc::Src::LU(0), rt_blend_factors_ops_src);
-      // Get if the blend control register requires loading the color to temp.z.
-      // temp.z = whether need to load the color.
-      a_.OpINE(temp_z_dest, temp_z_src, dxbc::Src::LU(0x00010001));
-      // Check if need to do something with the previous color.
-      // temp.z = free.
-      a_.OpIf(true, temp_z_src);
-      {
-        // *********************************************************************
-        // Loading the previous color to temp.zw.
-        // *********************************************************************
-
-        // Load the 32bpp color, or the lower 32 bits of the 64bpp color, to
-        // temp.z.
-        // temp.z = 32-bit packed color or lower 32 bits of the packed color.
-        if (uav_index_edram_ == kBindingIndexUnallocated) {
-          uav_index_edram_ = uav_count_++;
+      if (!(GetDxbcShaderModification().pixel.rov_full_write &&
+            GetDxbcShaderModification().pixel.rov_no_blend)) {
+        if (GetDxbcShaderModification().pixel.rov_full_write) {
+          a_.OpMov(temp_z_dest, dxbc::Src::LU(0));
+        } else {
+          // Get if need to keep any components to temp.z.
+          a_.OpOr(temp_z_dest, keep_mask_src.SelectFromSwizzled(0),
+                  keep_mask_src.SelectFromSwizzled(1));
         }
-        a_.OpLdUAVTyped(
-            temp_z_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
-            dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
-        // Get if the format is 64bpp to temp.w.
-        // temp.w = whether the render target is 64bpp.
-        a_.OpAnd(temp_w_dest, rt_format_flags_src,
-                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
-        // Check if the format is 64bpp.
-        // temp.w = free.
-        a_.OpIf(true, temp_w_src);
+        if (!GetDxbcShaderModification().pixel.rov_no_blend) {
+        if (GetDxbcShaderModification().pixel.rov_blend_profile) {
+          a_.OpMov(temp_z_dest, dxbc::Src::LU(1));
+        } else {
+          // Blending isn't done if it's 1 * source + 0 * destination. But since
+          // the previous color also needs to be loaded if any original components
+          // need to be kept, force the blend control to something with blending.
+          a_.OpMovC(temp_z_dest, temp_z_src, dxbc::Src::LU(0), rt_blend_factors_ops_src);
+          a_.OpINE(temp_z_dest, temp_z_src, dxbc::Src::LU(0x00010001));
+        }
+        }
+        // Check if need to do something with the previous color.
+        // temp.z = free.
+        a_.OpIf(true, temp_z_src);
         {
-          // Get the address of the upper 32 bits of the color to temp.w.
-          // temp.w = address of the upper 32 bits of the packed color.
-          a_.OpIAdd(temp_w_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-                    dxbc::Src::LU(1));
-          // Load the upper 32 bits of the 64bpp color to temp.w.
-          // temp.zw = packed destination color/alpha.
+          // *********************************************************************
+          // Loading the previous color to temp.zw.
+          // *********************************************************************
+
+          // Load the 32bpp color, or the lower 32 bits of the 64bpp color, to
+          // temp.z.
+          // temp.z = 32-bit packed color or lower 32 bits of the packed color.
           if (uav_index_edram_ == kBindingIndexUnallocated) {
             uav_index_edram_ = uav_count_++;
           }
           a_.OpLdUAVTyped(
-              temp_w_dest, temp_w_src, 1,
+              temp_z_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1,
               dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
-        }
-        // The color is 32bpp.
-        a_.OpElse();
-        {
-          // Break register dependency in temp.w if the color is 32bpp.
-          // temp.zw = packed destination color/alpha.
-          a_.OpMov(temp_w_dest, dxbc::Src::LU(0));
-        }
-        // Close the color format check.
-        a_.OpEndIf();
-
-        uint32_t color_temp = PushSystemTemp();
-        dxbc::Dest color_temp_rgb_dest(dxbc::Dest::R(color_temp, 0b0111));
-        dxbc::Dest color_temp_a_dest(dxbc::Dest::R(color_temp, 0b1000));
-        dxbc::Src color_temp_src(dxbc::Src::R(color_temp));
-        dxbc::Src color_temp_a_src(dxbc::Src::R(color_temp, dxbc::Src::kWWWW));
-
-        // Get if blending is enabled to color_temp.x.
-        // color_temp.x = whether blending is enabled.
-        a_.OpINE(dxbc::Dest::R(color_temp, 0b0001), rt_blend_factors_ops_src,
-                 dxbc::Src::LU(0x00010001));
-        // Check if need to blend.
-        // color_temp.x = free.
-        a_.OpIf(true, dxbc::Src::R(color_temp, dxbc::Src::kXXXX));
-        {
-          // Now, when blending is enabled, temp.xy are used as scratch since
-          // the color is packed after blending.
-
-          // Unpack the destination color to color_temp, using temp.xy as temps.
-          // The destination color never needs clamping because out-of-range
-          // values can't be loaded.
-          // color_temp.xyzw = destination color/alpha.
-          ROV_UnpackColor(i, temp, 2, color_temp, temp, 0, temp, 1);
-
-          // *******************************************************************
-          // Color blending.
-          // *******************************************************************
-
-          // Extract the color min/max bit to temp.x.
-          // temp.x = whether min/max should be used for color.
-          a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (5 + 1)));
-          // Check if need to do blend the color with factors.
-          // temp.x = free.
-          a_.OpIf(false, temp_x_src);
-          {
-            uint32_t blend_src_temp = PushSystemTemp();
-            dxbc::Dest blend_src_temp_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
-            dxbc::Src blend_src_temp_src(dxbc::Src::R(blend_src_temp));
-
-            // Extract the source color factor to temp.x.
-            // temp.x = source color factor index.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
-            // Check if the source color factor is not zero - if it is, the
-            // source must be ignored completely, and Infinity and NaN in it
-            // shouldn't affect blending.
-            a_.OpIf(true, temp_x_src);
+          if (ROV_IsRGBA8TargetSpecialized(i)) {
+            a_.OpMov(temp_w_dest, dxbc::Src::LU(0));
+          } else {
+            // Get if the format is 64bpp to temp.w.
+            a_.OpAnd(temp_w_dest, rt_format_flags_src,
+                     dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+            a_.OpIf(true, temp_w_src);
             {
-              // Open the switch for choosing the source color blend factor.
-              // temp.x = free.
-              a_.OpSwitch(temp_x_src);
-              // Write the source color factor to blend_src_temp.xyz.
-              // blend_src_temp.xyz = unclamped source color factor.
-              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_src_temp);
-              // Close the source color factor switch.
-              a_.OpEndSwitch();
-              // Get if the render target color is fixed-point and the source
-              // color factor needs clamping to temp.x.
-              // temp.x = whether color is fixed-point.
-              a_.OpAnd(temp_x_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
-              // Check if the source color factor needs clamping.
-              a_.OpIf(true, temp_x_src);
-              {
-                // Clamp the source color factor in blend_src_temp.xyz.
-                // blend_src_temp.xyz = source color factor.
-                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
-                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
-              }
-              // Close the source color factor clamping check.
-              a_.OpEndIf();
-              // Apply the factor to the source color.
-              // blend_src_temp.xyz = unclamped source color part without
-              //                      addition sign.
-              a_.OpMul(blend_src_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
-                       blend_src_temp_src);
-              // Check if the source color part needs clamping after the
-              // multiplication.
-              // temp.x = free.
-              a_.OpIf(true, temp_x_src);
-              {
-                // Clamp the source color part.
-                // blend_src_temp.xyz = source color part without addition sign.
-                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
-                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
-              }
-              // Close the source color part clamping check.
-              a_.OpEndIf();
-              // Extract the source color sign to temp.x.
-              // temp.x = source color sign as zero for 1 and non-zero for -1.
-              a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (5 + 2)));
-              // Apply the source color sign.
-              // blend_src_temp.xyz = source color part.
-              // temp.x = free.
-              a_.OpMovC(blend_src_temp_rgb_dest, temp_x_src, -blend_src_temp_src,
-                        blend_src_temp_src);
+            // Get the address of the upper 32 bits of the color to temp.w.
+            // temp.w = address of the upper 32 bits of the packed color.
+            a_.OpIAdd(temp_w_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                      dxbc::Src::LU(1));
+            // Load the upper 32 bits of the 64bpp color to temp.w.
+            // temp.zw = packed destination color/alpha.
+            if (uav_index_edram_ == kBindingIndexUnallocated) {
+              uav_index_edram_ = uav_count_++;
             }
-            // The source color factor is zero.
+            a_.OpLdUAVTyped(
+                temp_w_dest, temp_w_src, 1,
+                dxbc::Src::U(uav_index_edram_, uint32_t(UAVRegister::kEdram), dxbc::Src::kXXXX));
+            }
             a_.OpElse();
             {
-              // Write zero to the source color part.
-              // blend_src_temp.xyz = source color part.
-              // temp.x = free.
-              a_.OpMov(blend_src_temp_rgb_dest, dxbc::Src::LF(0.0f));
+            // Break register dependency in temp.w if the color is 32bpp.
+            // temp.zw = packed destination color/alpha.
+            a_.OpMov(temp_w_dest, dxbc::Src::LU(0));
             }
-            // Close the source color factor zero check.
             a_.OpEndIf();
+          }
 
-            // Extract the destination color factor to temp.x.
-            // temp.x = destination color factor index.
-            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
-            // Check if the destination color factor is not zero.
-            a_.OpIf(true, temp_x_src);
+          uint32_t color_temp = PushSystemTemp();
+          dxbc::Dest color_temp_rgb_dest(dxbc::Dest::R(color_temp, 0b0111));
+          dxbc::Dest color_temp_a_dest(dxbc::Dest::R(color_temp, 0b1000));
+          dxbc::Src color_temp_src(dxbc::Src::R(color_temp));
+          dxbc::Src color_temp_a_src(dxbc::Src::R(color_temp, dxbc::Src::kWWWW));
+
+          if (blend_profile) {
+          ROV_UnpackColor(i, temp, 2, color_temp, temp, 0, temp, 1);
+          dxbc::Src blend_src_rgb(dxbc::Src::R(blend_src_temp));
+          dxbc::Src blend_src_alpha(dxbc::Src::R(blend_src_temp, dxbc::Src::kWWWW));
+
+          if (blend_profile == 1 || blend_profile == 2) {
+            a_.OpAdd(temp_x_dest, dxbc::Src::LF(1.0f),
+                     -dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW));
+          } else {
+            a_.OpMov(temp_x_dest, dxbc::Src::LF(1.0f));
+          }
+          a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+          a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+          a_.OpMul(color_temp_rgb_dest, color_temp_src, temp_x_src);
+          a_.OpMax(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(0));
+          a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
+          a_.OpMAd(color_temp_rgb_dest, color_temp_src, dxbc::Src::LF(1.0f), blend_src_rgb);
+          a_.OpMax(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(0));
+          a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
+
+          if (blend_profile == 1) {
+            a_.OpMov(color_temp_a_dest, blend_src_alpha);
+          } else {
+            if (blend_profile == 2) {
+              a_.OpAdd(temp_x_dest, dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW));
+            } else {
+              a_.OpMov(temp_x_dest, dxbc::Src::LF(1.0f));
+            }
+            a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+            a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+            a_.OpMul(color_temp_a_dest, color_temp_a_src, temp_x_src);
+            a_.OpMax(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(1));
+            a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
+            a_.OpMAd(color_temp_a_dest, color_temp_a_src, dxbc::Src::LF(1.0f),
+                     blend_src_alpha);
+          }
+          a_.OpMax(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(1));
+          a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
+          uint32_t color_pack_temp = PushSystemTemp();
+          ROV_PackPreClampedColor(i, color_temp, temp, 0, color_pack_temp, 0, color_pack_temp, 1);
+          PopSystemTemp();
+          } else if (!GetDxbcShaderModification().pixel.rov_no_blend) {
+            // Get if blending is enabled to color_temp.x.
+            // color_temp.x = whether blending is enabled.
+            a_.OpINE(dxbc::Dest::R(color_temp, 0b0001), rt_blend_factors_ops_src,
+                     dxbc::Src::LU(0x00010001));
+            // Check if need to blend.
+            // color_temp.x = free.
+            a_.OpIf(true, dxbc::Src::R(color_temp, dxbc::Src::kXXXX));
             {
-              uint32_t blend_dest_factor_temp = PushSystemTemp();
-              dxbc::Src blend_dest_factor_temp_src(dxbc::Src::R(blend_dest_factor_temp));
-              // Open the switch for choosing the destination color blend
-              // factor.
+              // Now, when blending is enabled, temp.xy are used as scratch since
+              // the color is packed after blending.
+
+              // Unpack the destination color to color_temp, using temp.xy as temps.
+              // The destination color never needs clamping because out-of-range
+              // values can't be loaded.
+              // color_temp.xyzw = destination color/alpha.
+              ROV_UnpackColor(i, temp, 2, color_temp, temp, 0, temp, 1);
+
+              // *******************************************************************
+              // Color blending.
+              // *******************************************************************
+
+              // Extract the color min/max bit to temp.x.
+              // temp.x = whether min/max should be used for color.
+              a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (5 + 1)));
+              // Check if need to do blend the color with factors.
               // temp.x = free.
-              a_.OpSwitch(temp_x_src);
-              // Write the destination color factor to
-              // blend_dest_factor_temp.xyz.
-              // blend_dest_factor_temp.xyz = unclamped destination color
-              //                              factor.
-              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp,
-                                              blend_dest_factor_temp);
-              // Close the destination color factor switch.
-              a_.OpEndSwitch();
-              // Get if the render target color is fixed-point and the
-              // destination color factor needs clamping to temp.x.
-              // temp.x = whether color is fixed-point.
-              a_.OpAnd(temp_x_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
-              // Check if the destination color factor needs clamping.
-              a_.OpIf(true, temp_x_src);
+              a_.OpIf(false, temp_x_src);
               {
-                // Clamp the destination color factor in
-                // blend_dest_factor_temp.xyz.
-                // blend_dest_factor_temp.xyz = destination color factor.
-                a_.OpMax(dxbc::Dest::R(blend_dest_factor_temp, 0b0111), blend_dest_factor_temp_src,
-                         rt_clamp_vec_src.Select(0));
-                a_.OpMin(dxbc::Dest::R(blend_dest_factor_temp, 0b0111), blend_dest_factor_temp_src,
-                         rt_clamp_vec_src.Select(2));
-              }
-              // Close the destination color factor clamping check.
-              a_.OpEndIf();
-              // Apply the factor to the destination color in color_temp.xyz.
-              // color_temp.xyz = unclamped destination color part without
-              //                  addition sign.
-              // blend_dest_temp.xyz = free.
-              a_.OpMul(color_temp_rgb_dest, color_temp_src, blend_dest_factor_temp_src);
-              // Release blend_dest_factor_temp.
-              PopSystemTemp();
-              // Check if the destination color part needs clamping after the
-              // multiplication.
-              // temp.x = free.
-              a_.OpIf(true, temp_x_src);
-              {
-                // Clamp the destination color part.
-                // color_temp.xyz = destination color part without addition
-                // sign.
+                uint32_t blend_src_temp = PushSystemTemp();
+                dxbc::Dest blend_src_temp_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
+                dxbc::Src blend_src_temp_src(dxbc::Src::R(blend_src_temp));
+
+                // Extract the source color factor to temp.x.
+                // temp.x = source color factor index.
+                a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
+                // Check if the source color factor is not zero - if it is, the
+                // source must be ignored completely, and Infinity and NaN in it
+                // shouldn't affect blending.
+                a_.OpIf(true, temp_x_src);
+                {
+                  // Open the switch for choosing the source color blend factor.
+                  // temp.x = free.
+                  a_.OpSwitch(temp_x_src);
+                  // Write the source color factor to blend_src_temp.xyz.
+                  // blend_src_temp.xyz = unclamped source color factor.
+                  ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_src_temp);
+                  // Close the source color factor switch.
+                  a_.OpEndSwitch();
+                  // Get if the render target color is fixed-point and the source
+                  // color factor needs clamping to temp.x.
+                  // temp.x = whether color is fixed-point.
+                  a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                           dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+                  // Check if the source color factor needs clamping.
+                  a_.OpIf(true, temp_x_src);
+                  {
+                    // Clamp the source color factor in blend_src_temp.xyz.
+                    // blend_src_temp.xyz = source color factor.
+                    a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                    a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+                  }
+                  // Close the source color factor clamping check.
+                  a_.OpEndIf();
+                  // Apply the factor to the source color.
+                  // blend_src_temp.xyz = unclamped source color part without
+                  //                      addition sign.
+                  a_.OpMul(blend_src_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
+                           blend_src_temp_src);
+                  // Check if the source color part needs clamping after the
+                  // multiplication.
+                  // temp.x = free.
+                  a_.OpIf(true, temp_x_src);
+                  {
+                    // Clamp the source color part.
+                    // blend_src_temp.xyz = source color part without addition sign.
+                    a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                    a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+                  }
+                  // Close the source color part clamping check.
+                  a_.OpEndIf();
+                  // Extract the source color sign to temp.x.
+                  // temp.x = source color sign as zero for 1 and non-zero for -1.
+                  a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (5 + 2)));
+                  // Apply the source color sign.
+                  // blend_src_temp.xyz = source color part.
+                  // temp.x = free.
+                  a_.OpMovC(blend_src_temp_rgb_dest, temp_x_src, -blend_src_temp_src,
+                            blend_src_temp_src);
+                }
+                // The source color factor is zero.
+                a_.OpElse();
+                {
+                  // Write zero to the source color part.
+                  // blend_src_temp.xyz = source color part.
+                  // temp.x = free.
+                  a_.OpMov(blend_src_temp_rgb_dest, dxbc::Src::LF(0.0f));
+                }
+                // Close the source color factor zero check.
+                a_.OpEndIf();
+
+                // Extract the destination color factor to temp.x.
+                // temp.x = destination color factor index.
+                a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
+                // Check if the destination color factor is not zero.
+                a_.OpIf(true, temp_x_src);
+                {
+                  uint32_t blend_dest_factor_temp = PushSystemTemp();
+                  dxbc::Src blend_dest_factor_temp_src(dxbc::Src::R(blend_dest_factor_temp));
+                  // Open the switch for choosing the destination color blend
+                  // factor.
+                  // temp.x = free.
+                  a_.OpSwitch(temp_x_src);
+                  // Write the destination color factor to
+                  // blend_dest_factor_temp.xyz.
+                  // blend_dest_factor_temp.xyz = unclamped destination color
+                  //                              factor.
+                  ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp,
+                                                  blend_dest_factor_temp);
+                  // Close the destination color factor switch.
+                  a_.OpEndSwitch();
+                  // Get if the render target color is fixed-point and the
+                  // destination color factor needs clamping to temp.x.
+                  // temp.x = whether color is fixed-point.
+                  a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                           dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+                  // Check if the destination color factor needs clamping.
+                  a_.OpIf(true, temp_x_src);
+                  {
+                    // Clamp the destination color factor in
+                    // blend_dest_factor_temp.xyz.
+                    // blend_dest_factor_temp.xyz = destination color factor.
+                    a_.OpMax(dxbc::Dest::R(blend_dest_factor_temp, 0b0111), blend_dest_factor_temp_src,
+                             rt_clamp_vec_src.Select(0));
+                    a_.OpMin(dxbc::Dest::R(blend_dest_factor_temp, 0b0111), blend_dest_factor_temp_src,
+                             rt_clamp_vec_src.Select(2));
+                  }
+                  // Close the destination color factor clamping check.
+                  a_.OpEndIf();
+                  // Apply the factor to the destination color in color_temp.xyz.
+                  // color_temp.xyz = unclamped destination color part without
+                  //                  addition sign.
+                  // blend_dest_temp.xyz = free.
+                  a_.OpMul(color_temp_rgb_dest, color_temp_src, blend_dest_factor_temp_src);
+                  // Release blend_dest_factor_temp.
+                  PopSystemTemp();
+                  // Check if the destination color part needs clamping after the
+                  // multiplication.
+                  // temp.x = free.
+                  a_.OpIf(true, temp_x_src);
+                  {
+                    // Clamp the destination color part.
+                    // color_temp.xyz = destination color part without addition
+                    // sign.
+                    a_.OpMax(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(0));
+                    a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
+                  }
+                  // Close the destination color part clamping check.
+                  a_.OpEndIf();
+                  // Extract the destination color sign to temp.x.
+                  // temp.x = destination color sign as zero for 1 and non-zero for
+                  //          -1.
+                  a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
+                  // Select the sign for destination multiply-add as 1.0 or -1.0 to
+                  // temp.x.
+                  // temp.x = destination color sign as float.
+                  a_.OpMovC(temp_x_dest, temp_x_src, dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f));
+                  // Perform color blending to color_temp.xyz.
+                  // color_temp.xyz = unclamped blended color.
+                  // blend_src_temp.xyz = free.
+                  // temp.x = free.
+                  a_.OpMAd(color_temp_rgb_dest, color_temp_src, temp_x_src, blend_src_temp_src);
+                }
+                // The destination color factor is zero.
+                a_.OpElse();
+                {
+                  // Write the source color part without applying the destination
+                  // color.
+                  // color_temp.xyz = unclamped blended color.
+                  // blend_src_temp.xyz = free.
+                  // temp.x = free.
+                  a_.OpMov(color_temp_rgb_dest, blend_src_temp_src);
+                }
+                // Close the destination color factor zero check.
+                a_.OpEndIf();
+
+                // Release blend_src_temp.
+                PopSystemTemp();
+
+                // Clamp the color in color_temp.xyz before packing.
+                // color_temp.xyz = blended color.
                 a_.OpMax(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(0));
                 a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
               }
-              // Close the destination color part clamping check.
-              a_.OpEndIf();
-              // Extract the destination color sign to temp.x.
-              // temp.x = destination color sign as zero for 1 and non-zero for
-              //          -1.
-              a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
-              // Select the sign for destination multiply-add as 1.0 or -1.0 to
-              // temp.x.
-              // temp.x = destination color sign as float.
-              a_.OpMovC(temp_x_dest, temp_x_src, dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f));
-              // Perform color blending to color_temp.xyz.
-              // color_temp.xyz = unclamped blended color.
-              // blend_src_temp.xyz = free.
-              // temp.x = free.
-              a_.OpMAd(color_temp_rgb_dest, color_temp_src, temp_x_src, blend_src_temp_src);
-            }
-            // The destination color factor is zero.
-            a_.OpElse();
-            {
-              // Write the source color part without applying the destination
-              // color.
-              // color_temp.xyz = unclamped blended color.
-              // blend_src_temp.xyz = free.
-              // temp.x = free.
-              a_.OpMov(color_temp_rgb_dest, blend_src_temp_src);
-            }
-            // Close the destination color factor zero check.
-            a_.OpEndIf();
-
-            // Release blend_src_temp.
-            PopSystemTemp();
-
-            // Clamp the color in color_temp.xyz before packing.
-            // color_temp.xyz = blended color.
-            a_.OpMax(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(0));
-            a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
-          }
-          // Need to do min/max for color.
-          a_.OpElse();
-          {
-            // Extract the color min (0) or max (1) bit to temp.x
-            // temp.x = whether min or max should be used for color.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
-            // Check if need to do min or max for color.
-            // temp.x = free.
-            a_.OpIf(true, temp_x_src);
-            {
-              // Choose max of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
-            }
-            // Need to do min.
-            a_.OpElse();
-            {
-              // Choose min of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
-            }
-            // Close the min or max check.
-            a_.OpEndIf();
-          }
-          // Close the color factor blending or min/max check.
-          a_.OpEndIf();
-
-          // *******************************************************************
-          // Alpha blending.
-          // *******************************************************************
-
-          // Extract the alpha min/max bit to temp.x.
-          // temp.x = whether min/max should be used for alpha.
-          a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (21 + 1)));
-          // Check if need to do blend the color with factors.
-          // temp.x = free.
-          a_.OpIf(false, temp_x_src);
-          {
-            // Extract the source alpha factor to temp.x.
-            // temp.x = source alpha factor index.
-            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(16), rt_blend_factors_ops_src);
-            // Check if the source alpha factor is not zero.
-            a_.OpIf(true, temp_x_src);
-            {
-              // Open the switch for choosing the source alpha blend factor.
-              // temp.x = free.
-              a_.OpSwitch(temp_x_src);
-              // Write the source alpha factor to temp.x.
-              // temp.x = unclamped source alpha factor.
-              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 0);
-              // Close the source alpha factor switch.
-              a_.OpEndSwitch();
-              // Get if the render target alpha is fixed-point and the source
-              // alpha factor needs clamping to temp.y.
-              // temp.y = whether alpha is fixed-point.
-              a_.OpAnd(temp_y_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
-              // Check if the source alpha factor needs clamping.
-              a_.OpIf(true, temp_y_src);
+              // Need to do min/max for color.
+              a_.OpElse();
               {
-                // Clamp the source alpha factor in temp.x.
-                // temp.x = source alpha factor.
-                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
-                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+                // Extract the color min (0) or max (1) bit to temp.x
+                // temp.x = whether min or max should be used for color.
+                a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
+                // Check if need to do min or max for color.
+                // temp.x = free.
+                a_.OpIf(true, temp_x_src);
+                {
+                  // Choose max of the colors without applying the factors to
+                  // color_temp.xyz.
+                  // color_temp.xyz = blended color.
+                  a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+                }
+                // Need to do min.
+                a_.OpElse();
+                {
+                  // Choose min of the colors without applying the factors to
+                  // color_temp.xyz.
+                  // color_temp.xyz = blended color.
+                  a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+                }
+                // Close the min or max check.
+                a_.OpEndIf();
               }
-              // Close the source alpha factor clamping check.
+              // Close the color factor blending or min/max check.
               a_.OpEndIf();
-              // Apply the factor to the source alpha.
-              // temp.x = unclamped source alpha part without addition sign.
-              a_.OpMul(temp_x_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       temp_x_src);
-              // Check if the source alpha part needs clamping after the
-              // multiplication.
-              // temp.y = free.
-              a_.OpIf(true, temp_y_src);
-              {
-                // Clamp the source alpha part.
-                // temp.x = source alpha part without addition sign.
-                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
-                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
-              }
-              // Close the source alpha part clamping check.
-              a_.OpEndIf();
-              // Extract the source alpha sign to temp.y.
-              // temp.y = source alpha sign as zero for 1 and non-zero for -1.
-              a_.OpAnd(temp_y_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (21 + 2)));
-              // Apply the source alpha sign.
-              // temp.x = source alpha part.
-              a_.OpMovC(temp_x_dest, temp_y_src, -temp_x_src, temp_x_src);
-            }
-            // The source alpha factor is zero.
-            a_.OpElse();
-            {
-              // Write zero to the source alpha part.
-              // temp.x = source alpha part.
-              a_.OpMov(temp_x_dest, dxbc::Src::LF(0.0f));
-            }
-            // Close the source alpha factor zero check.
-            a_.OpEndIf();
 
-            // Extract the destination alpha factor to temp.y.
-            // temp.y = destination alpha factor index.
-            a_.OpUBFE(temp_y_dest, dxbc::Src::LU(5), dxbc::Src::LU(24), rt_blend_factors_ops_src);
-            // Check if the destination alpha factor is not zero.
-            a_.OpIf(true, temp_y_src);
-            {
-              // Open the switch for choosing the destination alpha blend
-              // factor.
-              // temp.y = free.
-              a_.OpSwitch(temp_y_src);
-              // Write the destination alpha factor to temp.y.
-              // temp.y = unclamped destination alpha factor.
-              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 1);
-              // Close the destination alpha factor switch.
-              a_.OpEndSwitch();
-              // Get if the render target alpha is fixed-point and the
-              // destination alpha factor needs clamping.
-              // alpha_is_fixed_temp.x = whether alpha is fixed-point.
-              uint32_t alpha_is_fixed_temp = PushSystemTemp();
-              a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001), rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
-              // Check if the destination alpha factor needs clamping.
-              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+              // *******************************************************************
+              // Alpha blending.
+              // *******************************************************************
+
+              // Extract the alpha min/max bit to temp.x.
+              // temp.x = whether min/max should be used for alpha.
+              a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (21 + 1)));
+              // Check if need to do blend the color with factors.
+              // temp.x = free.
+              a_.OpIf(false, temp_x_src);
               {
-                // Clamp the destination alpha factor in temp.y.
-                // temp.y = destination alpha factor.
-                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
-                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
-              }
-              // Close the destination alpha factor clamping check.
-              a_.OpEndIf();
-              // Apply the factor to the destination alpha in color_temp.w.
-              // color_temp.w = unclamped destination alpha part without
-              //                addition sign.
-              a_.OpMul(color_temp_a_dest, color_temp_a_src, temp_y_src);
-              // Check if the destination alpha part needs clamping after the
-              // multiplication.
-              // alpha_is_fixed_temp.x = free.
-              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
-              // Release alpha_is_fixed_temp.
-              PopSystemTemp();
-              {
-                // Clamp the destination alpha part.
-                // color_temp.w = destination alpha part without addition sign.
+                // Extract the source alpha factor to temp.x.
+                // temp.x = source alpha factor index.
+                a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(16), rt_blend_factors_ops_src);
+                // Check if the source alpha factor is not zero.
+                a_.OpIf(true, temp_x_src);
+                {
+                  // Open the switch for choosing the source alpha blend factor.
+                  // temp.x = free.
+                  a_.OpSwitch(temp_x_src);
+                  // Write the source alpha factor to temp.x.
+                  // temp.x = unclamped source alpha factor.
+                  ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 0);
+                  // Close the source alpha factor switch.
+                  a_.OpEndSwitch();
+                  // Get if the render target alpha is fixed-point and the source
+                  // alpha factor needs clamping to temp.y.
+                  // temp.y = whether alpha is fixed-point.
+                  a_.OpAnd(temp_y_dest, rt_format_flags_src,
+                           dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+                  // Check if the source alpha factor needs clamping.
+                  a_.OpIf(true, temp_y_src);
+                  {
+                    // Clamp the source alpha factor in temp.x.
+                    // temp.x = source alpha factor.
+                    a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                    a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+                  }
+                  // Close the source alpha factor clamping check.
+                  a_.OpEndIf();
+                  // Apply the factor to the source alpha.
+                  // temp.x = unclamped source alpha part without addition sign.
+                  a_.OpMul(temp_x_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                           temp_x_src);
+                  // Check if the source alpha part needs clamping after the
+                  // multiplication.
+                  // temp.y = free.
+                  a_.OpIf(true, temp_y_src);
+                  {
+                    // Clamp the source alpha part.
+                    // temp.x = source alpha part without addition sign.
+                    a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                    a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+                  }
+                  // Close the source alpha part clamping check.
+                  a_.OpEndIf();
+                  // Extract the source alpha sign to temp.y.
+                  // temp.y = source alpha sign as zero for 1 and non-zero for -1.
+                  a_.OpAnd(temp_y_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << (21 + 2)));
+                  // Apply the source alpha sign.
+                  // temp.x = source alpha part.
+                  a_.OpMovC(temp_x_dest, temp_y_src, -temp_x_src, temp_x_src);
+                }
+                // The source alpha factor is zero.
+                a_.OpElse();
+                {
+                  // Write zero to the source alpha part.
+                  // temp.x = source alpha part.
+                  a_.OpMov(temp_x_dest, dxbc::Src::LF(0.0f));
+                }
+                // Close the source alpha factor zero check.
+                a_.OpEndIf();
+
+                // Extract the destination alpha factor to temp.y.
+                // temp.y = destination alpha factor index.
+                a_.OpUBFE(temp_y_dest, dxbc::Src::LU(5), dxbc::Src::LU(24), rt_blend_factors_ops_src);
+                // Check if the destination alpha factor is not zero.
+                a_.OpIf(true, temp_y_src);
+                {
+                  // Open the switch for choosing the destination alpha blend
+                  // factor.
+                  // temp.y = free.
+                  a_.OpSwitch(temp_y_src);
+                  // Write the destination alpha factor to temp.y.
+                  // temp.y = unclamped destination alpha factor.
+                  ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 1);
+                  // Close the destination alpha factor switch.
+                  a_.OpEndSwitch();
+                  // Get if the render target alpha is fixed-point and the
+                  // destination alpha factor needs clamping.
+                  // alpha_is_fixed_temp.x = whether alpha is fixed-point.
+                  uint32_t alpha_is_fixed_temp = PushSystemTemp();
+                  a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001), rt_format_flags_src,
+                           dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+                  // Check if the destination alpha factor needs clamping.
+                  a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+                  {
+                    // Clamp the destination alpha factor in temp.y.
+                    // temp.y = destination alpha factor.
+                    a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                    a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+                  }
+                  // Close the destination alpha factor clamping check.
+                  a_.OpEndIf();
+                  // Apply the factor to the destination alpha in color_temp.w.
+                  // color_temp.w = unclamped destination alpha part without
+                  //                addition sign.
+                  a_.OpMul(color_temp_a_dest, color_temp_a_src, temp_y_src);
+                  // Check if the destination alpha part needs clamping after the
+                  // multiplication.
+                  // alpha_is_fixed_temp.x = free.
+                  a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+                  // Release alpha_is_fixed_temp.
+                  PopSystemTemp();
+                  {
+                    // Clamp the destination alpha part.
+                    // color_temp.w = destination alpha part without addition sign.
+                    a_.OpMax(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(1));
+                    a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
+                  }
+                  // Close the destination alpha factor clamping check.
+                  a_.OpEndIf();
+                  // Extract the destination alpha sign to temp.y.
+                  // temp.y = destination alpha sign as zero for 1 and non-zero for
+                  //          -1.
+                  a_.OpAnd(temp_y_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
+                  // Select the sign for destination multiply-add as 1.0 or -1.0 to
+                  // temp.y.
+                  // temp.y = destination alpha sign as float.
+                  a_.OpMovC(temp_y_dest, temp_y_src, dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f));
+                  // Perform alpha blending to color_temp.w.
+                  // color_temp.w = unclamped blended alpha.
+                  // temp.xy = free.
+                  a_.OpMAd(color_temp_a_dest, color_temp_a_src, temp_y_src, temp_x_src);
+                }
+                // The destination alpha factor is zero.
+                a_.OpElse();
+                {
+                  // Write the source alpha part without applying the destination
+                  // alpha.
+                  // color_temp.w = unclamped blended alpha.
+                  // temp.xy = free.
+                  a_.OpMov(color_temp_a_dest, temp_x_src);
+                }
+                // Close the destination alpha factor zero check.
+                a_.OpEndIf();
+
+                // Clamp the alpha in color_temp.w before packing.
+                // color_temp.w = blended alpha.
                 a_.OpMax(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(1));
                 a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
               }
-              // Close the destination alpha factor clamping check.
+              // Need to do min/max for alpha.
+              a_.OpElse();
+              {
+                // Extract the alpha min (0) or max (1) bit to temp.x.
+                // temp.x = whether min or max should be used for alpha.
+                a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
+                // Check if need to do min or max for alpha.
+                // temp.x = free.
+                a_.OpIf(true, temp_x_src);
+                {
+                  // Choose max of the alphas without applying the factors to
+                  // color_temp.w.
+                  // color_temp.w = blended alpha.
+                  a_.OpMax(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                           color_temp_a_src);
+                }
+                // Need to do min.
+                a_.OpElse();
+                {
+                  // Choose min of the alphas without applying the factors to
+                  // color_temp.w.
+                  // color_temp.w = blended alpha.
+                  a_.OpMin(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                           color_temp_a_src);
+                }
+                // Close the min or max check.
+                a_.OpEndIf();
+              }
+              // Close the alpha factor blending or min/max check.
               a_.OpEndIf();
-              // Extract the destination alpha sign to temp.y.
-              // temp.y = destination alpha sign as zero for 1 and non-zero for
-              //          -1.
-              a_.OpAnd(temp_y_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
-              // Select the sign for destination multiply-add as 1.0 or -1.0 to
-              // temp.y.
-              // temp.y = destination alpha sign as float.
-              a_.OpMovC(temp_y_dest, temp_y_src, dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f));
-              // Perform alpha blending to color_temp.w.
-              // color_temp.w = unclamped blended alpha.
-              // temp.xy = free.
-              a_.OpMAd(color_temp_a_dest, color_temp_a_src, temp_y_src, temp_x_src);
-            }
-            // The destination alpha factor is zero.
-            a_.OpElse();
-            {
-              // Write the source alpha part without applying the destination
-              // alpha.
-              // color_temp.w = unclamped blended alpha.
-              // temp.xy = free.
-              a_.OpMov(color_temp_a_dest, temp_x_src);
-            }
-            // Close the destination alpha factor zero check.
-            a_.OpEndIf();
 
-            // Clamp the alpha in color_temp.w before packing.
-            // color_temp.w = blended alpha.
-            a_.OpMax(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(1));
-            a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
-          }
-          // Need to do min/max for alpha.
-          a_.OpElse();
-          {
-            // Extract the alpha min (0) or max (1) bit to temp.x.
-            // temp.x = whether min or max should be used for alpha.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
-            // Check if need to do min or max for alpha.
-            // temp.x = free.
-            a_.OpIf(true, temp_x_src);
-            {
-              // Choose max of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMax(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              // Pack the new color/alpha to temp.xy.
+              // temp.xy = packed new color/alpha.
+              uint32_t color_pack_temp = PushSystemTemp();
+              ROV_PackPreClampedColor(i, color_temp, temp, 0, color_pack_temp, 0, color_pack_temp, 1);
+              // Release color_pack_temp.
+              PopSystemTemp();
             }
-            // Need to do min.
-            a_.OpElse();
-            {
-              // Choose min of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMin(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
-            }
-            // Close the min or max check.
+            // Close the blending check.
             a_.OpEndIf();
           }
-          // Close the alpha factor blending or min/max check.
-          a_.OpEndIf();
 
-          // Pack the new color/alpha to temp.xy.
-          // temp.xy = packed new color/alpha.
-          uint32_t color_pack_temp = PushSystemTemp();
-          ROV_PackPreClampedColor(i, color_temp, temp, 0, color_pack_temp, 0, color_pack_temp, 1);
-          // Release color_pack_temp.
-          PopSystemTemp();
+          // *********************************************************************
+          // Write mask application
+          // *********************************************************************
+
+          if (GetDxbcShaderModification().pixel.rov_full_write) {
+            PopSystemTemp();
+          } else {
+            // Apply the keep mask to the previous packed color/alpha in temp.zw.
+            // temp.zw = masked packed old color/alpha.
+            a_.OpAnd(dxbc::Dest::R(temp, 0b1100), dxbc::Src::R(temp),
+                     keep_mask_src.SwizzleSwizzled(0b0100 << 4));
+            // Invert the keep mask into color_temp.xy.
+            // color_temp.xy = inverted keep mask (write mask).
+            a_.OpNot(dxbc::Dest::R(color_temp, 0b0011), keep_mask_src);
+            // Release color_temp.
+            PopSystemTemp();
+            // Apply the write mask to the new color/alpha in temp.xy.
+            // temp.xy = masked packed new color/alpha.
+            a_.OpAnd(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::R(color_temp));
+            // Combine the masked colors into temp.xy.
+            // temp.xy = packed resulting color/alpha.
+            // temp.zw = free.
+            a_.OpOr(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::R(temp, 0b1110));
+          }
         }
-        // Close the blending check.
+        // Close the previous color load check.
         a_.OpEndIf();
-
-        // *********************************************************************
-        // Write mask application
-        // *********************************************************************
-
-        // Apply the keep mask to the previous packed color/alpha in temp.zw.
-        // temp.zw = masked packed old color/alpha.
-        a_.OpAnd(dxbc::Dest::R(temp, 0b1100), dxbc::Src::R(temp),
-                 keep_mask_src.SwizzleSwizzled(0b0100 << 4));
-        // Invert the keep mask into color_temp.xy.
-        // color_temp.xy = inverted keep mask (write mask).
-        a_.OpNot(dxbc::Dest::R(color_temp, 0b0011), keep_mask_src);
-        // Release color_temp.
-        PopSystemTemp();
-        // Apply the write mask to the new color/alpha in temp.xy.
-        // temp.xy = masked packed new color/alpha.
-        a_.OpAnd(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::R(color_temp));
-        // Combine the masked colors into temp.xy.
-        // temp.xy = packed resulting color/alpha.
-        // temp.zw = free.
-        a_.OpOr(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::R(temp, 0b1110));
       }
-      // Close the previous color load check.
-      a_.OpEndIf();
 
       // ***********************************************************************
       // Writing the color
@@ -2558,14 +2812,11 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       }
       a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
                          dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), 1, temp_x_src);
-      // Get if the format is 64bpp to temp.z.
-      // temp.z = whether the render target is 64bpp.
-      a_.OpAnd(temp_z_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
-      // Check if the format is 64bpp.
-      // temp.z = free.
-      a_.OpIf(true, temp_z_src);
-      {
+      if (!ROV_IsRGBA8TargetSpecialized(i)) {
+        a_.OpAnd(temp_z_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+        a_.OpIf(true, temp_z_src);
+        {
         // Get the address of the upper 32 bits of the color to temp.z (can't
         // use temp.x because components when not blending, packing is done once
         // for all samples, so it has to be preserved).
@@ -2577,9 +2828,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         }
         a_.OpStoreUAVTyped(dxbc::Dest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
                            temp_z_src, 1, temp_y_src);
+        }
+        a_.OpEndIf();
       }
-      // Close the 64bpp conditional.
-      a_.OpEndIf();
 
       // ***********************************************************************
       // End of color sample raster operation.
@@ -2593,7 +2844,18 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // +(80*scale_x) and -(80*scale_x+dwpp) after each sample).
       // Though no need to do this for the last sample as for the next render
       // target, the address will be recalculated.
-      if (j < 3) {
+      if (j + 1 < ROV_GetSampleCount()) {
+        if (ROV_IsRGBA8TargetSpecialized(i)) {
+          if (j & 1) {
+            a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                      dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                      dxbc::Src::LI(-int32_t(tile_width) + (2 - int32_t(j))));
+          } else {
+            a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                      dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                      dxbc::Src::LU(tile_width));
+          }
+        } else {
         if (j & 1) {
           // temp.z = whether the render target is 64bpp.
           a_.OpAnd(temp_z_dest, rt_format_flags_src,
@@ -2610,7 +2872,12 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
                     dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
                     dxbc::Src::LU(tile_width));
         }
+        }
       }
+    }
+
+    if (blend_profile) {
+      PopSystemTemp();
     }
 
     // Close the render target write check.

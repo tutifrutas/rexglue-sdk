@@ -37,6 +37,12 @@ class HostPathDevice : public Device {
   bool allow_share_delete() const { return allow_share_delete_; }
   const std::filesystem::path& host_path() const { return host_path_; }
 
+  // Some title boot code opens a mounted directory as a raw volume handle
+  // and reads the volume's sector header from that handle.  Keep this opt-in
+  // so the normal extracted-tree device remains an ordinary HostPathDevice.
+  void EnableRootSectorProbe() { root_sector_probe_enabled_ = true; }
+  bool root_sector_probe_enabled() const { return root_sector_probe_enabled_; }
+
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 255; }
@@ -54,6 +60,7 @@ class HostPathDevice : public Device {
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
   bool allow_share_delete_;
+  bool root_sector_probe_enabled_ = false;
 };
 
 }  // namespace rex::filesystem

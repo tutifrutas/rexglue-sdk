@@ -3,26 +3,15 @@
 # Provides ppc_add_test_binary() for assembling, linking, and generating
 # symbol maps from PPC assembly test files.
 
-# Locate PPC toolchain in tools/ directory
-set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils")
-
-if(WIN32)
-    set(PPC_ASSEMBLER "${PPC_TOOLS_DIR}/powerpc-none-elf-as.exe")
-    set(PPC_LINKER "${PPC_TOOLS_DIR}/powerpc-none-elf-ld.exe")
-    set(PPC_NM "${PPC_TOOLS_DIR}/powerpc-none-elf-nm.exe")
-else()
-    set(PPC_ASSEMBLER "${PPC_TOOLS_DIR}/powerpc-none-elf-as")
-    set(PPC_LINKER "${PPC_TOOLS_DIR}/powerpc-none-elf-ld")
-    set(PPC_NM "${PPC_TOOLS_DIR}/powerpc-none-elf-nm")
-endif()
-
-# Verify toolchain exists
-if(NOT EXISTS "${PPC_ASSEMBLER}")
-    message(FATAL_ERROR "PPC assembler not found at ${PPC_ASSEMBLER}")
-endif()
-if(NOT EXISTS "${PPC_LINKER}")
-    message(FATAL_ERROR "PPC linker not found at ${PPC_LINKER}")
-endif()
+# Supply a PowerPC binutils toolchain with VMX128 support; no prebuilt
+# third-party executables are bundled in this repository.
+set(PPC_TOOLS_DIR "" CACHE PATH "Directory containing VMX128-capable PowerPC binutils")
+find_program(PPC_ASSEMBLER NAMES powerpc-none-elf-as powerpc-linux-gnu-as
+    HINTS "${PPC_TOOLS_DIR}" REQUIRED)
+find_program(PPC_LINKER NAMES powerpc-none-elf-ld powerpc-linux-gnu-ld
+    HINTS "${PPC_TOOLS_DIR}" REQUIRED)
+find_program(PPC_NM NAMES powerpc-none-elf-nm powerpc-linux-gnu-nm
+    HINTS "${PPC_TOOLS_DIR}" REQUIRED)
 
 message(STATUS "PowerPC assembler: ${PPC_ASSEMBLER}")
 message(STATUS "PowerPC linker: ${PPC_LINKER}")

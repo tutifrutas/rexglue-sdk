@@ -88,6 +88,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // ROV - all written color targets use the 1 * source + 0 * destination
+      // blend equation, so the blending implementation can be omitted.
+      uint32_t rov_no_blend : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -636,6 +639,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs, spv::Id operand_1_abs);
+  // Pack/unpack two floats as Xbox 360 extended-range float16, where exponent
+  // 31 is a large finite value (up to +-131008), not Inf/NaN.
+  spv::Id PackFloat16x2ExtendedRange(spv::Id float2_value);
+  spv::Id UnpackFloat16x2ExtendedRange(spv::Id packed_uint);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component

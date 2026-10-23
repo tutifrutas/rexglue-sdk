@@ -11,8 +11,10 @@
  */
 
 #include <cstdint>
+#include <mutex>
 
 #include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/device.h>
 
@@ -38,6 +40,22 @@ class VulkanShader : public SpirvShader {
                         const uint32_t* ucode_dwords, size_t ucode_dword_count,
                         std::endian ucode_source_endian = std::endian::big);
 
+  // Vulkan descriptors must follow DXBC registration order. The compact base
+  // layout remains trivially hashable for existing descriptor-layout keys.
+  const std::vector<SpirvShader::TextureBinding>& GetTextureBindingsAfterTranslation() const {
+    std::lock_guard<std::mutex> lock(rov_bindings_mutex_);
+    return rov_texture_bindings_;
+  }
+  uint32_t GetUsedTextureMaskAfterTranslation() const {
+    std::lock_guard<std::mutex> lock(rov_bindings_mutex_);
+    return rov_used_texture_mask_;
+  }
+  const std::vector<SpirvShader::SamplerBinding>& GetSamplerBindingsAfterTranslation() const {
+    std::lock_guard<std::mutex> lock(rov_bindings_mutex_);
+    return rov_sampler_bindings_;
+  }
+  void SetRovBindings(const DxbcShader& dxbc_shader);
+
   // For owning subsystem like the pipeline cache, accessors for unique
   // identifiers (used instead of hashes to make sure collisions can't happen)
   // of binding layouts used by the shader, for invalidation if a shader with an
@@ -56,7 +74,12 @@ class VulkanShader : public SpirvShader {
 
  private:
   const ui::vulkan::VulkanDevice* vulkan_device_;
+  std::vector<SpirvShader::TextureBinding> rov_texture_bindings_;
+  std::vector<SpirvShader::SamplerBinding> rov_sampler_bindings_;
+  uint32_t rov_used_texture_mask_ = 0;
 
+  mutable std::mutex rov_bindings_mutex_;
+  bool rov_bindings_set_up_ = false;
   std::atomic_flag binding_layout_user_uids_set_up_ = ATOMIC_FLAG_INIT;
   size_t texture_binding_layout_user_uid_ = 0;
   size_t sampler_binding_layout_user_uid_ = 0;

@@ -187,13 +187,15 @@ static uint8_t next_cpu = 0;
 static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
   // NOTE: proc_mask is logical processors, not physical processors or cores.
   if (!proc_mask) {
+    // Xbox 360 leaves an unassigned child on its parent's hardware thread.
+    // Match Xenia/ReXGlue reference behavior rather than round-robin assigning
+    // every child, which can change guest synchronization ordering.
+    XThread* parent = current_xthread_tls_;
+    if (parent) {
+      return parent->active_cpu();
+    }
     next_cpu = (next_cpu + 1) % 6;
-    return next_cpu;  // is this reasonable?
-    // TODO(Triang3l): Does the following apply here?
-    // https://docs.microsoft.com/en-us/windows/win32/dxtecharts/coding-for-multiple-cores
-    // "On Xbox 360, you must explicitly assign software threads to a particular
-    //  hardware thread by using XSetThreadProcessor. Otherwise, all child
-    //  threads will stay on the same hardware thread as the parent."
+    return next_cpu;
   }
   assert_false(proc_mask & 0xC0);
 
@@ -465,13 +467,21 @@ X_STATUS XThread::Create() {
     return X_STATUS_NO_MEMORY;
   }
 
+  if (guest_thread_) {
+    REXSYS_TRACE("Guest thread create handle={:08X} start={:08X} context={:08X} flags={:08X}",
+                 handle(), creation_params_.start_address, creation_params_.start_context,
+                 creation_params_.creation_flags);
+  }
+
   // Set the thread name based on host ID (for easier debugging).
   if (thread_name_.empty()) {
     set_name(fmt::format("XThread{:04X}", thread_->system_id()));
   }
 
   if (creation_params_.creation_flags & 0x60) {
-    thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
+    thread_->set_priority(creation_params_.creation_flags & 0x20
+                              ? rex::thread::ThreadPriority::kAboveNormal
+                              : rex::thread::ThreadPriority::kNormal);
   }
 
   // Assign the newly created thread to the logical processor, and also set up
@@ -597,6 +607,9 @@ void XThread::Execute() {
     want_exit_code = true;
   }
 
+  REXSYS_TRACE("Guest thread start handle={:08X} entry={:08X} arg={:08X}",
+               handle(), address, args.empty() ? 0u : static_cast<uint32_t>(args[0]));
+
   // NOTE(tomc): JIT execution replaced with direct function calls
   // In rexglue, guest code is compiled ahead of time and called directly.
   // The start_address points to a 32bit guest address, for which the function
@@ -648,6 +661,8 @@ void XThread::Execute() {
   func(*ctx, base);
 
   exit_code = static_cast<int>(ctx->r3.u32);
+  REXSYS_TRACE("Guest thread return handle={:08X} entry={:08X} r3={:08X}", handle(),
+               address, static_cast<uint32_t>(ctx->r3.u32));
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).

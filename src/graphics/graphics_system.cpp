@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -201,6 +202,56 @@ void GraphicsSystem::Shutdown() {
   }
 
   provider_.reset();
+}
+
+system::GuestFrameStats GraphicsSystem::guest_frame_stats() const {
+  const uint64_t scale = guest_render_scale_.load(std::memory_order_relaxed);
+  const uint64_t size = guest_framebuffer_size_.load(std::memory_order_relaxed);
+  return {
+      guest_frame_count_snapshot_.load(std::memory_order_relaxed),
+      guest_fps_.load(std::memory_order_relaxed),
+      guest_frame_time_ms_.load(std::memory_order_relaxed),
+      uint32_t(scale >> 32),
+      uint32_t(scale),
+      uint32_t(size >> 32),
+      uint32_t(size),
+  };
+}
+
+void GraphicsSystem::RecordGuestRenderScale(uint32_t scale_x, uint32_t scale_y) {
+  guest_render_scale_.store((uint64_t(scale_x) << 32) | scale_y, std::memory_order_relaxed);
+}
+
+void GraphicsSystem::RecordGuestFramebufferSize(uint32_t width, uint32_t height) {
+  // Publish the dimensions as one value so the UI cannot mix two frame sizes.
+  guest_framebuffer_size_.store((uint64_t(width) << 32) | height, std::memory_order_relaxed);
+}
+
+void GraphicsSystem::RecordGuestFrame(uint64_t host_ticks, uint64_t host_frequency) {
+  if (!host_frequency) {
+    return;
+  }
+
+  ++guest_frame_count_;
+  guest_frame_count_snapshot_.store(guest_frame_count_, std::memory_order_relaxed);
+
+  guest_frame_window_ticks_.push_back(host_ticks);
+  while (guest_frame_window_ticks_.size() > 2 &&
+         host_ticks - guest_frame_window_ticks_.front() > host_frequency) {
+    guest_frame_window_ticks_.pop_front();
+  }
+  if (guest_frame_window_ticks_.size() >= 2) {
+    const uint64_t window_ticks =
+        guest_frame_window_ticks_.back() - guest_frame_window_ticks_.front();
+    const size_t intervals = guest_frame_window_ticks_.size() - 1;
+    if (window_ticks) {
+      guest_fps_.store(static_cast<double>(intervals) * host_frequency / window_ticks,
+                       std::memory_order_relaxed);
+      guest_frame_time_ms_.store(static_cast<double>(window_ticks) * 1000.0 /
+                                     host_frequency / intervals,
+                                 std::memory_order_relaxed);
+    }
+  }
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {

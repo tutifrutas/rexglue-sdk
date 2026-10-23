@@ -930,19 +930,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
     static uint64_t last_frame_tick = 0;
     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
     if (last_frame_tick) {
-      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
       int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
       PROFILE_FRAME_TIME_US(dt_us);
       PROFILE_FPS(freq / (now - last_frame_tick));
     }
     last_frame_tick = now;
+    if (graphics_system_ && freq) {
+      graphics_system_->RecordGuestFrame(now, freq);
+    }
   }
-#endif
   rex::perf::Profiler::Flip();
 
   // Xenia-specific VdSwap hook.

@@ -95,6 +95,12 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Temporary read-only inspection hook for diagnosing guest resources. This
+  // intentionally exposes no mutation or ownership of the backing memory.
+  const uint8_t* DebugTranslatePhysical(uint32_t address) const {
+    return memory_.TranslatePhysical<const uint8_t*>(address);
+  }
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

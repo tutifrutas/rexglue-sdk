@@ -1,60 +1,91 @@
-> [!CAUTION]
-> This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
+# ReXGlue SDK — native Linux
 
-<h1 align="center">
-  <br>
-  <a href="https://github.com/rexglue/rexglue-sdk">
-    <img src="https://github.com/rexglue/rexglue-media/blob/main/ReX_Banner.png" alt="ReXGlue banner">
-  </a>
-  <br>
-  <br>
-  <a href="https://discord.gg/CNTxwSNZfT">
-    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
-  </a>
-  <a href="https://github.com/rexglue/rexglue-sdk/stargazers">
-    <img src="https://img.shields.io/github/stars/rexglue/rexglue-sdk" alt="rexglue-sdk stargazers">
-  </a>
-</h1>
+The shared static-recompilation SDK for
+[Tekken 6](https://github.com/tutifrutas/tekken6-360-native-linux) and
+[Tekken Tag Tournament 2](https://github.com/tutifrutas/tekken-tag-tournament-2-360-native-linux)
+on Linux. It generates C++ from a user-supplied Xbox 360 executable and provides
+the runtime, Vulkan graphics, SDL input/audio and Linux NTSYNC integration.
+No Wine or Proton is required. The game ports do not support online play.
 
-ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
+This fork is based on [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk).
+Its supported game-port target is Linux x86-64. No game data, generated game
+sources, proprietary SDKs, artwork or prebuilt game binaries are included.
 
-ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia-project), the Xbox 360 emulator. Rather than interpreting or JIT-compiling PPC instructions at runtime, ReXGlue takes a different path: it generates C++ source code ahead of time, an approach inspired by [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and [rexdex's recompiler](https://github.com/rexdex/recompiler).
+## Requirements
 
-Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.
+- Linux x86-64, Git, Clang 18+, a C++23 standard library, CMake 3.25+, Ninja,
+  Meson, Python 3.11+, pkg-config and the usual C build tools.
+- Development headers/libraries for X11/XCB (`x11-xcb` in pkg-config) and
+  Wayland (`wayland-client`), plus your distribution's SDL3 build prerequisites.
+  SDL3 is built from the pinned source submodule; see
+  [SDL's Linux dependencies](https://wiki.libsdl.org/SDL3/README-linux).
+- A Vulkan-capable graphics driver. Running these game ports requires Vulkan
+  1.3, `VK_EXT_fragment_shader_interlock` and the additional renderer feature
+  checks. Wayland and the FSI/ROV renderer are the Linux defaults.
+- To run games and NTSYNC tests: a kernel providing `/dev/ntsync` and permission
+  for your user to open it read/write. There is no silent POSIX fallback.
 
-## Builds
+Dependencies are pinned in `.gitmodules` and CMake. Initialize submodules
+recursively. The Vulkan build also fetches pinned
+[dxbc-spirv](https://github.com/doitsujin/dxbc-spirv) sources at configure time;
+Meson builds that shader compiler as a native library. Network access is needed
+for source dependencies, not for gameplay. Qt and KDE are not SDK requirements.
 
-| Channel | CI | Download |
-| --- | --- | --- |
-| Release | [![win-amd64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml) [![linux-amd64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-amd64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-amd64.yaml) [![linux-arm64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-aarch64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-aarch64.yaml) | [Latest stable](https://github.com/rexglue/rexglue-sdk/releases/latest) |
-| Nightly | [![nightly](https://github.com/rexglue/rexglue-sdk/actions/workflows/nightly.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/nightly.yaml) | [Latest pre-release](https://github.com/rexglue/rexglue-sdk/releases?q=prerelease%3Atrue) |
+## Build
 
-## Quickstart
+```sh
+git clone --recurse-submodules https://github.com/tutifrutas/rexglue-sdk.git
+cd rexglue-sdk
+cmake -S . -B build/linux -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release -DREXGLUE_USE_D3D12=OFF \
+  -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF \
+  -DREXGLUE_ENABLE_PERF_COUNTERS=OFF
+cmake --build build/linux --parallel 8
+out/linux-amd64/rexglue --help
+```
 
-For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
+The game repositories normally build the SDK as a CMake subdirectory using
+`-DREXSDK_DIR=/path/to/rexglue-sdk`; a separate SDK installation is not required.
+See each game's README for local disc preparation, code generation and launch.
+Use the [upstream documentation](https://github.com/rexglue/rexglue-sdk/wiki)
+for the general SDK and recompiler interfaces.
 
-# **Disclaimer**
-ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 
+## Tests
 
-This project is not intended to promote piracy nor unauthorized use of copyrighted material. Any misuse of this software to endorse or enable this type of activity is strictly prohibited.
+The full test build needs PowerPC binutils with VMX128 assembler support.
+Prebuilt toolchain executables are not bundled. Supply an installed toolchain
+with `powerpc-none-elf-as`, `powerpc-none-elf-ld` and `powerpc-none-elf-nm`
+(or compatible `powerpc-linux-gnu-*` names). Ordinary distro assemblers may
+lack VMX128; verify support for `-mvmx128` before enabling the instruction tests.
 
+```sh
+cmake -S . -B build/tests -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release -DREXGLUE_BUILD_TESTS=ON \
+  -DPPC_TOOLS_DIR=/path/to/powerpc-binutils/bin \
+  -DREXGLUE_USE_VULKAN=ON -DREXGLUE_ENABLE_TRACY=OFF \
+  -DREXGLUE_ENABLE_PERF_COUNTERS=OFF
+cmake --build build/tests --parallel 8
+ctest --test-dir build/tests --output-on-failure
+# Optional Python build-tool checks (requires pytest):
+python3 -m pytest scripts/tests
+```
 
-# Credits
+Tests use source-level fixtures rather than game assets. NTSYNC tests require
+the runtime device permissions described above.
 
-## ReXGlue
-- [Tom (crack)](https://github.com/tomcl7) - Project Founder
-- [Loreaxe](https://github.com/Loreaxe) - Linux Contributor
-- [mystixor](https://github.com/Mystixor) - Windows Contributor
-- [Graine25](https://github.com/Graine25) - Project Support
-- [Carlos Estrague (mrcmunir)](https://github.com/mrcmunir) - Linux / ARM64 Contributor
-- [sanjay900](https://github.com/sanjay900) - Linux / SDL Contributor
-- [Toby](https://github.com/TbyDtch) - Project Support
-- [Roxxsen](https://github.com/Roxxsen) - CI/CD Contributor
+## License and credits
 
-The list above is not exhaustive. Thanks to everyone in the ReXGlue community who contributes code, files issues, tests builds, and keeps the project moving.
+The SDK retains its [BSD license](LICENSE), including the ReXGlue and Xenia
+copyright notices. Original Linux-port contributions are BSD-3-Clause.
+Third-party components retain their own licenses; see [NOTICE](NOTICE) and the
+license files in each dependency. The BSD license does not replace GPL, LGPL
+or other dependency obligations.
 
-## Very Special Thank You:
-- [Project Xenia](https://github.com/xenia-project/xenia/tree/master/src/xenia) - Their invaluable work on Xbox 360 emulation laid the groundwork for ReXGlue's development. This project (and numerous others) would not exist without their hard work and dedication.
-- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - For pioneering the modern static recompilation approach for Xbox 360. A lot of the codegen analysis logic and instruction translations are based on their work. Thank you!
-- [rexdex's recompiler](https://github.com/rexdex/recompiler) - The OG static recompiler for Xbox 360. 
-- Many others in the Xbox 360 homebrew and modding communities whose work and research have contributed to the collective knowledge that makes projects like this possible.
+ReXGlue builds on [Xenia](https://github.com/xenia-project/xenia),
+[XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and
+[rexdex's recompiler](https://github.com/rexdex/recompiler).
+Game names and trademarks belong to their respective owners. This independent
+project is not affiliated with Bandai Namco or Microsoft and grants no rights
+to any game content.

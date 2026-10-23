@@ -215,7 +215,10 @@ bool ProcessKeyEvent(KeyEvent& e) {
       continue;
     VirtualKey vk = ParseVirtualKey(entry.current_key);
     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
-      entry.callback();
+      // Toggle actions fire once per press, not on OS key-repeat events.
+      if (!e.prev_state()) {
+        entry.callback();
+      }
       e.set_handled(true);
       return true;
     }

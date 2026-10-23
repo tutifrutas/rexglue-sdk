@@ -12,6 +12,7 @@
 #pragma once
 
 #include <span>
+#include <array>
 #include <string>
 
 #include <rex/filesystem.h>
@@ -24,7 +25,8 @@ class HostPathEntry;
 class HostPathFile : public File {
  public:
   HostPathFile(uint32_t file_access, HostPathEntry* entry,
-               std::unique_ptr<rex::filesystem::FileHandle> file_handle);
+               std::unique_ptr<rex::filesystem::FileHandle> file_handle,
+               bool root_sector_probe = false);
   ~HostPathFile() override;
 
   void Destroy() override;
@@ -35,7 +37,16 @@ class HostPathFile : public File {
   X_STATUS SetLength(size_t length) override;
 
  private:
+  static constexpr size_t kJoshOffset = 0x800;
+  static constexpr size_t kJoshSize = 0x400;
+
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
+  bool root_sector_probe_ = false;
+  // A root-sector probe is a virtual, per-handle sector rather than a host
+  // file.  Keep writes in memory so the retail read/modify/write bootstrap
+  // observes its own data on subsequent reads without mutating the extracted
+  // game tree.
+  std::array<uint8_t, kJoshSize> root_sector_{};
 };
 
 }  // namespace rex::filesystem

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
@@ -27,6 +28,8 @@
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
+
+REXCVAR_DECLARE(bool, d3d12_fused_resolve);
 
 namespace rex::graphics::d3d12 {
 
@@ -89,6 +92,13 @@ class D3D12TextureCache final : public TextureCache {
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
+
+  // Experimental full-surface RGBA8 ROV resolve target. Returns null when no
+  // exactly matching, UAV-capable sampled texture is already cached.
+  ID3D12Resource* PrepareFusedResolveTexture(uint32_t base, uint32_t width, uint32_t height,
+                                             uint32_t pitch, xenos::TextureFormat format,
+                                             D3D12_CPU_DESCRIPTOR_HANDLE uav_handle);
+  bool CompleteFusedResolveTexture(ID3D12Resource* resource);
 
   // Must be called within a submission - creates and untiles textures needed by
   // shaders and puts them in the SRV state. This may bind compute pipelines
@@ -456,6 +466,7 @@ class D3D12TextureCache final : public TextureCache {
 
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
+  bool fused_resolve_supported_ = false;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;

@@ -21,10 +21,14 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_BOOL(spirv_disable_rounding_mode_rte, false, "GPU/Shader",
+                    "Disable RoundingModeRTE in SPIR-V shaders, for RenderDoc's shader debugger");
 
 namespace rex::graphics {
 
@@ -56,7 +60,8 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       signed_zero_inf_nan_preserve_float32(
           vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
-      rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
+      rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32 &&
+                                !REXCVAR_GET(spirv_disable_rounding_mode_rte)),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading) {

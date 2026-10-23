@@ -21,7 +21,9 @@ class NullEntry;
 
 class NullDevice : public Device {
  public:
-  NullDevice(const std::string& mount_path, const std::initializer_list<std::string>& null_paths);
+  NullDevice(const std::string& mount_path,
+             const std::initializer_list<std::string>& null_paths,
+             uint32_t sectors_per_allocation_unit = 0x80);
   ~NullDevice() override;
 
   bool Initialize() override;
@@ -37,9 +39,9 @@ class NullDevice : public Device {
   uint32_t total_allocation_units() const override { return 0x10; }
   uint32_t available_allocation_units() const override { return 0x10; }
 
-  // STFC/cache code seems to require the product of the next two to equal
-  // 0x10000
-  uint32_t sectors_per_allocation_unit() const override { return 0x80; }
+  uint32_t sectors_per_allocation_unit() const override {
+    return sectors_per_allocation_unit_;
+  }
 
   // STFC requires <= 0x1000
   uint32_t bytes_per_sector() const override { return 0x200; }
@@ -48,6 +50,7 @@ class NullDevice : public Device {
   std::string name_;
   std::unique_ptr<Entry> root_entry_;
   std::vector<std::string> null_paths_;
+  uint32_t sectors_per_allocation_unit_ = 0x80;
 };
 
 }  // namespace rex::filesystem

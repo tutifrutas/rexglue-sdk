@@ -72,8 +72,14 @@ elseif(UNIX)
         seh_posix.cpp
         socket_posix.cpp
         system_posix.cpp
-        threading_posix.cpp
     )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Linux guest synchronization is kernel-backed NTSYNC, without a
+        # condition-variable/polling fallback. Other POSIX targets are unchanged.
+        target_sources(rexcore PRIVATE threading_linux.cpp)
+    else()
+        target_sources(rexcore PRIVATE threading_posix.cpp)
+    endif()
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).

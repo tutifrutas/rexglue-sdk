@@ -225,10 +225,12 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
     case rex::thread::WaitResult::kTimeout:
       rex::thread::MaybeYield();
       return X_STATUS_TIMEOUT;
-    default:
     case rex::thread::WaitResult::kAbandoned:
-    case rex::thread::WaitResult::kFailed:
+      WaitCallback();
       return X_STATUS_ABANDONED_WAIT_0;
+    default:
+    case rex::thread::WaitResult::kFailed:
+      return X_STATUS_UNSUCCESSFUL;
   }
 }
 
@@ -252,10 +254,12 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
     case rex::thread::WaitResult::kTimeout:
       rex::thread::MaybeYield();
       return X_STATUS_TIMEOUT;
-    default:
     case rex::thread::WaitResult::kAbandoned:
-    case rex::thread::WaitResult::kFailed:
+      wait_object->WaitCallback();
       return X_STATUS_ABANDONED_WAIT_0;
+    default:
+    case rex::thread::WaitResult::kFailed:
+      return X_STATUS_UNSUCCESSFUL;
   }
 }
 
@@ -288,9 +292,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
       case rex::thread::WaitResult::kTimeout:
         rex::thread::MaybeYield();
         return X_STATUS_TIMEOUT;
-      default:
       case rex::thread::WaitResult::kAbandoned:
+        objects[result.second]->WaitCallback();
         return X_STATUS(X_STATUS_ABANDONED_WAIT_0 + result.second);
+      default:
       case rex::thread::WaitResult::kFailed:
         return X_STATUS_UNSUCCESSFUL;
     }
@@ -311,10 +316,14 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
       case rex::thread::WaitResult::kTimeout:
         rex::thread::MaybeYield();
         return X_STATUS_TIMEOUT;
-      default:
       case rex::thread::WaitResult::kAbandoned:
-      case rex::thread::WaitResult::kFailed:
+        for (uint32_t i = 0; i < count; ++i) {
+          objects[i]->WaitCallback();
+        }
         return X_STATUS_ABANDONED_WAIT_0;
+      default:
+      case rex::thread::WaitResult::kFailed:
+        return X_STATUS_UNSUCCESSFUL;
     }
   }
 }

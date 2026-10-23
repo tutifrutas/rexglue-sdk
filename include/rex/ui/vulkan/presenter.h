@@ -281,7 +281,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -292,7 +291,6 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -333,11 +331,16 @@ class VulkanPresenter final : public Presenter {
     };
 
     struct SwapchainFramebuffer {
-      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer)
-          : image_view(image_view), framebuffer(framebuffer) {}
+      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer,
+                           VkSemaphore present_semaphore)
+          : image_view(image_view), framebuffer(framebuffer),
+            present_semaphore(present_semaphore) {}
 
       VkImageView image_view;
       VkFramebuffer framebuffer;
+      // Reacquiring this image, not completing a draw submission, proves that
+      // presentation has consumed the previous wait on this semaphore.
+      VkSemaphore present_semaphore;
     };
 
     explicit PaintContext(const VulkanDevice* const vulkan_device)
@@ -414,6 +417,9 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // VK_KHR_present_id values are per swapchain; restart when it changes.
+    VkSwapchainKHR present_id_swapchain = VK_NULL_HANDLE;
+    uint64_t present_id = 0;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
   };

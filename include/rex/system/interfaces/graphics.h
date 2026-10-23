@@ -31,6 +31,20 @@ class KernelState;
 
 namespace rex::system {
 
+struct GuestFrameStats {
+  uint64_t frame_count = 0;
+  double fps = 0.0;
+  double frame_time_ms = 0.0;
+  // Effective backend draw scale, not the requested cvars. Zero until a
+  // backend has acquired a guest frame for presentation.
+  uint32_t draw_resolution_scale_x = 0;
+  uint32_t draw_resolution_scale_y = 0;
+  // Active guest framebuffer region in backend texels, before host presentation.
+  // Not necessarily the game's pre-upscale 3D scene resolution.
+  uint32_t framebuffer_width = 0;
+  uint32_t framebuffer_height = 0;
+};
+
 class IGraphicsSystem {
  public:
   virtual ~IGraphicsSystem() = default;
@@ -56,6 +70,9 @@ class IGraphicsSystem {
   // leave these null.
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
+
+  // Timing between guest XE_SWAP packets, independent of host UI presents.
+  virtual GuestFrameStats guest_frame_stats() const { return {}; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -46,6 +47,14 @@ class D3D12CommandProcessor;
 
 class PipelineCache {
  public:
+  struct ROVDrawState {
+    uint32_t normalized_color_mask = 0;
+    uint32_t rt_keep_masks[4][2] = {{UINT32_MAX, UINT32_MAX}, {UINT32_MAX, UINT32_MAX},
+                                   {UINT32_MAX, UINT32_MAX}, {UINT32_MAX, UINT32_MAX}};
+    float rt_clamp[4][4] = {};
+    bool depth_stencil_enabled = false;
+  };
+
   static constexpr size_t kLayoutUIDEmpty = 0;
 
   PipelineCache(D3D12CommandProcessor& command_processor, const RegisterFile& register_file,
@@ -78,7 +87,12 @@ class PipelineCache {
       uint32_t interpolator_mask) const;
   DxbcShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-      reg::RB_DEPTHCONTROL normalized_depth_control) const;
+      reg::RB_DEPTHCONTROL normalized_depth_control, const ROVDrawState& rov_draw_state) const;
+  DxbcShaderTranslator::Modification GetCurrentDepthOnlyPixelShaderModification(
+      reg::RB_DEPTHCONTROL normalized_depth_control, const ROVDrawState& rov_draw_state) const;
+  ROVDrawState GetCurrentROVDrawState(uint32_t written_color_targets,
+                                     reg::RB_DEPTHCONTROL normalized_depth_control,
+                                     uint32_t normalized_color_mask) const;
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
   // MUST be made nullptr BEFORE calling this!
@@ -89,7 +103,8 @@ class PipelineCache {
                          uint32_t normalized_color_mask,
                          uint32_t bound_depth_and_color_render_target_bits,
                          const uint32_t* bound_depth_and_color_render_targets_formats,
-                         void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
+                         uint64_t pixel_shader_modification, void** pipeline_handle_out,
+                         ID3D12RootSignature** root_signature_out);
 
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
@@ -219,7 +234,7 @@ class PipelineCache {
 
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
-    static constexpr uint32_t kVersion = 0x20210425;
+    static constexpr uint32_t kVersion = 0x20261018;
   });
 
   REXPACKEDSTRUCT(PipelineStoredDescription, {
@@ -232,6 +247,7 @@ class PipelineCache {
     D3D12Shader::D3D12Translation* vertex_shader;
     D3D12Shader::D3D12Translation* pixel_shader;
     const std::vector<uint32_t>* geometry_shader;
+    std::shared_ptr<const std::vector<uint8_t>> depth_only_pixel_shader;
     PipelineDescription description;
   };
 
@@ -281,7 +297,8 @@ class PipelineCache {
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
       uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_target_formats,
-      PipelineRuntimeDescription& runtime_description_out, bool for_placeholder = false);
+      uint64_t pixel_shader_modification, PipelineRuntimeDescription& runtime_description_out,
+      bool for_placeholder = false);
 
   static bool GetGeometryShaderKey(PipelineGeometryShader geometry_shader_type,
                                    DxbcShaderTranslator::Modification vertex_shader_modification,
@@ -341,6 +358,9 @@ class PipelineCache {
   // Empty depth-only pixel shader for writing to depth buffer via ROV when no
   // Xenos pixel shader provided.
   std::vector<uint8_t> depth_only_pixel_shader_;
+  std::mutex depth_only_pixel_shaders_mutex_;
+  std::map<uint64_t, std::shared_ptr<const std::vector<uint8_t>>> depth_only_pixel_shaders_;
+  std::shared_ptr<const std::vector<uint8_t>> GetDepthOnlyPixelShader(uint64_t modification_value);
 
   struct Pipeline {
     // nullptr if creation has failed.

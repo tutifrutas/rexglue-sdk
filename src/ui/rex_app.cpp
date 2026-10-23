@@ -12,6 +12,8 @@
 #include <rex/rex_app.h>
 
 #include <cstdlib>
+#include <functional>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -49,6 +51,11 @@
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics backend used by the GPU plugin: any, d3d12, or vulkan")
+    .allowed({"any", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -157,20 +164,16 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
 
-  // Late-phase logging
-  std::string log_file_cvar = REXCVAR_GET(log_file);
   std::string log_level_str = REXCVAR_GET(log_level);
   if (REXCVAR_GET(log_verbose) && log_level_str == "info")
     log_level_str = "trace";
 
-  auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
-  auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
-                                        log_level_str, category_levels);
-  if (log_file_cvar.empty()) {
-    log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
-  }
-
+  auto log_config =
+      rex::BuildLogConfig(log_level_str, rex::ParseCategoryLevelsFromConfig(config_path_));
+  log_config.app_name = std::string(GetName());
+  log_config.log_dir = exe_dir / "logs";
+  OnConfigureLogging(log_config);
+  rex::ApplyLogCvarOverrides(log_config);
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
 
@@ -248,15 +251,15 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     ppc_info_.register_modules(runtime_->kernel_state());
   }
 
-  if (imgui_drawer_) {
-    auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
-    if (input_sys) {
-      input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
-          return true;
-        return !imgui_drawer_->GetIO().WantCaptureMouse;
-      });
-    }
+  if (auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system())) {
+    input_sys->SetActiveCallback([this]() {
+      if (window_ && !window_->HasFocus())
+        return false;
+      if (!imgui_drawer_ ||
+          (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))
+        return true;
+      return !imgui_drawer_->GetIO().WantCaptureMouse;
+    });
   }
 
   std::string xex_image = "game:\\default.xex";
@@ -314,7 +317,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =
@@ -334,7 +337,7 @@ bool ReXApp::SetupPresentation() {
   }
 
   // Create window
-  window_ = rex::ui::Window::Create(app_context(), GetName(), 1280, 720);
+  window_ = rex::ui::Window::Create(app_context(), GetName());
   if (!window_) {
     REXLOG_ERROR("Failed to create window");
     return false;
@@ -350,11 +353,40 @@ bool ReXApp::SetupPresentation() {
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
   }
-  rex::cvar::RegisterChangeCallback("fullscreen", [this](std::string_view, std::string_view value) {
-    if (window_) {
-      window_->SetFullscreen(rex::string::from_string<bool>(value, false));
-    }
+  window_->SetMonitor(REXCVAR_GET(monitor));
+
+  auto on_window_cvar = [this](const char* name, std::function<void(std::string_view)> apply) {
+    rex::cvar::RegisterChangeCallback(
+        name, [this, apply = std::move(apply)](std::string_view, std::string_view value) {
+          app_context().CallInUIThread([this, apply, value = std::string(value)] {
+            if (window_) {
+              apply(value);
+            }
+          });
+        });
+  };
+
+  on_window_cvar("fullscreen", [this](std::string_view value) {
+    window_->SetFullscreen(rex::string::from_string<bool>(value, false));
   });
+  on_window_cvar("fullscreen_exclusive",
+                 [this](std::string_view) { window_->RefreshFullscreen(); });
+  on_window_cvar("monitor", [this](std::string_view value) {
+    window_->SetMonitor(rex::string::from_string<int32_t>(value, 0));
+  });
+  auto apply_window_size = [this](std::string_view) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    rex::ui::Window::ResolveConfiguredLogicalSize(width, height);
+    window_->SetDesiredLogicalSize(width, height);
+  };
+  on_window_cvar("window_width", apply_window_size);
+  on_window_cvar("window_height", apply_window_size);
+  on_window_cvar("resolution", [this, apply_window_size](std::string_view value) {
+    apply_window_size(value);
+    window_->RefreshFullscreen();
+  });
+
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();
@@ -394,7 +426,12 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
+  rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle fullscreen", [this] {
+    if (window_) {
+      rex::cvar::SetFlagByName("fullscreen", window_->IsFullscreen() ? "false" : "true");
+    }
+  });
+  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle FPS and resolution overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
     } else {
@@ -558,6 +595,7 @@ void ReXApp::OnDestroy() {
   OnShutdown();
 
   // Unregister overlay keybinds before destroying dialogs
+  rex::ui::UnregisterBind("bind_fullscreen");
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");

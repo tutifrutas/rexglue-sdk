@@ -33,6 +33,8 @@
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/rov_system_constants.h>
+#include <rex/graphics/vulkan/rov_diagnostics.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
@@ -140,8 +142,8 @@ class VulkanCommandProcessor : public CommandProcessor {
         ->vulkan_device();
   }
 
-  bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
-                          std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+  static bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+                                std::vector<uint32_t>& spirv_out, std::string& error_out);
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -152,7 +154,7 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
-    return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+    return submission_submitted_ + 1;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
@@ -418,7 +420,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool EndSubmission(bool is_swap);
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
-    return !submission_open_ && submissions_in_flight_fences_.empty();
+    return !submission_open_ && submission_completed_ == submission_submitted_;
   }
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
@@ -493,6 +495,7 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  void CaptureRovResolve(uint32_t written_address, uint32_t written_length, bool succeeded);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -518,16 +521,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineStageFlags guest_shader_pipeline_stages_ = 0;
   VkShaderStageFlags guest_shader_vertex_stages_ = 0;
 
-  std::vector<VkFence> fences_free_;
   std::vector<VkSemaphore> semaphores_free_;
 
+  // Submission N signals value N; completion is the counter value.
+  VkSemaphore submission_timeline_ = VK_NULL_HANDLE;
   bool submission_open_ = false;
   uint64_t submission_completed_ = 0;
+  uint64_t submission_submitted_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
-  std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
@@ -788,6 +792,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
 
+  // Resolved descriptor contents for the last draw in this frame. Compare
+  // actual views and sampler handles, so texture reloads and sampler eviction
+  // invalidate bindings even when guest fetch constants are unchanged.
+  std::vector<VkDescriptorImageInfo> texture_descriptor_contents_[2];
+  VkDescriptorSetLayout texture_descriptor_layouts_[2] = {};
+  uint32_t texture_descriptor_image_counts_[2] = {};
+
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
@@ -807,7 +818,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
   VkDescriptorBufferInfo
-      current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
+      current_constant_buffer_infos_[rov::kConstantBufferCount];
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
@@ -835,7 +846,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t current_float_constant_map_pixel_[4];
 
   // System shader constants.
+  // Generated Vulkan helper stages and DXBC-derived guest stages have distinct
+  // layouts. Never reinterpret one as the other.
   SpirvShaderTranslator::SystemConstants system_constants_;
+  rov::SystemConstants rov_system_constants_{};
+  std::unique_ptr<rov::diagnostics::Capture> rov_capture_;
+  uint64_t rov_draw_counter_ = 0;
+  uint64_t rov_resolve_counter_ = 0;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

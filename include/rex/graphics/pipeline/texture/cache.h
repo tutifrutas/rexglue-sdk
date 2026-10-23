@@ -516,6 +516,12 @@ class TextureCache {
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
 
+  // Backend cache extensions may inspect existing keys for specialized
+  // producers, but must keep insertion, eviction and invalidation in the base
+  // cache implementation.
+  auto& GetCachedTexturesForBackend() { return textures_; }
+  auto AcquireGlobalCacheLock() { return global_critical_region_.Acquire(); }
+
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];

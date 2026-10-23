@@ -2,11 +2,12 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Ported from Xenia Canary e6cd2e4 into ReXGlue, 2026. Canary
+ *              targets SDL2; only the SDL calls are translated to SDL3.
  */
 
 #pragma once
@@ -15,25 +16,34 @@
 #include <queue>
 #include <stack>
 
+#include <SDL3/SDL.h>
+
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
-
-#include <SDL3/SDL.h>
 
 namespace rex::audio::sdl {
 
 class SDLAudioDriver : public AudioDriver {
  public:
-  SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
+  SDLAudioDriver(rex::thread::Semaphore* semaphore,
+                 uint32_t frequency = kFrameFrequencyDefault,
+                 uint32_t channels = kFrameChannelsDefault,
+                 bool need_format_conversion = true);
   ~SDLAudioDriver() override;
 
-  bool Initialize();
-  void SubmitFrame(uint32_t frame_ptr) override;
-  void Shutdown();
+  bool Initialize() override;
+  void SubmitFrame(float* frame) override;
+  void Pause() override;
+  void Resume() override;
+  void SetVolume(float volume) override { volume_ = volume; };
+  void Shutdown() override;
 
  protected:
-  static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
-                          int total_amount);
+  // SDL2's fixed-size pull, one device buffer of `len` bytes per call.
+  static void SDLCallback(void* userdata, Uint8* stream, int len);
+  // SDL3 stream callback: delivers SDL2-sized buffers through SDLCallback.
+  static void SDLStreamCallback(void* userdata, SDL_AudioStream* stream,
+                                int additional_amount, int total_amount);
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 
@@ -41,11 +51,13 @@ class SDLAudioDriver : public AudioDriver {
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
 
-  static const uint32_t frame_frequency_ = 48000;
-  static const uint32_t frame_channels_ = 6;
-  static const uint32_t channel_samples_ = 256;
-  static const uint32_t frame_samples_ = frame_channels_ * channel_samples_;
-  static const uint32_t frame_size_ = sizeof(float) * frame_samples_;
+  float volume_ = 1.0f;
+
+  uint32_t frame_frequency_;
+  uint32_t frame_channels_;
+  uint32_t channel_samples_;
+  uint32_t frame_size_;
+  bool need_format_conversion_;
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};

@@ -14,6 +14,7 @@
 #include "rex/system/function_dispatcher.h"
 
 #include <atomic>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -57,6 +58,10 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::KernelState* kernel_state() const { return kernel_state_; }
   ::rex::ui::GraphicsProvider* provider() const override { return provider_.get(); }
   ::rex::ui::Presenter* presenter() const override { return presenter_.get(); }
+  system::GuestFrameStats guest_frame_stats() const override;
+  void RecordGuestFrame(uint64_t host_ticks, uint64_t host_frequency);
+  void RecordGuestRenderScale(uint32_t scale_x, uint32_t scale_y);
+  void RecordGuestFramebufferSize(uint32_t width, uint32_t height);
 
   X_STATUS SetupPresentation(::rex::ui::WindowedAppContext* app_context) override;
   X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
@@ -130,6 +135,15 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic_flag host_gpu_loss_reported_;
+
+  std::deque<uint64_t> guest_frame_window_ticks_;
+  uint64_t guest_frame_count_ = 0;
+  // One atomic keeps the X/Y scale coherent between GPU and UI threads.
+  std::atomic<uint64_t> guest_render_scale_{0};
+  std::atomic<uint64_t> guest_framebuffer_size_{0};
+  std::atomic<double> guest_fps_{0.0};
+  std::atomic<double> guest_frame_time_ms_{0.0};
+  std::atomic<uint64_t> guest_frame_count_snapshot_{0};
 };
 
 }  // namespace rex::graphics

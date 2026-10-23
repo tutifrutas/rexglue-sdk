@@ -19,6 +19,10 @@
 #include <rex/memory.h>
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
+#include <rex/thread.h>
+
+#include "repeated_guest_fault.h"
 #include <rex/types.h>
 
 using namespace rex::arch;
@@ -416,9 +420,26 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
-    if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+    if (access_violation_callback_ &&
+        access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                   fault_host_address, is_write)) {
+      return true;
+    }
+    // Returning from an unhandled POSIX signal retries the faulting instruction.
+    // Bound this path without counting successfully handled protection faults.
+    static thread_local RepeatedGuestFault repeated_fault;
+    if (repeated_fault.Record(ex->fault_address())) {
+      auto* thread_state = ThreadState::Get();
+      auto* context = thread_state ? thread_state->context() : nullptr;
+      REX_FATAL(
+          "Unhandled guest access violation repeated {} times: {} host={:016X} "
+          "guest={:08X} host_tid={:X} guest_tid={:08X} pc={:016X} "
+          "lr={:016X} last_indirect={:08X} last_indirect_lr={:08X}",
+          RepeatedGuestFault::kLimit, is_write ? "write" : "read", ex->fault_address(),
+          fault_guest_virtual_address, rex::thread::current_thread_id(),
+          thread_state ? thread_state->thread_id() : 0, ex->pc(),
+          context ? context->lr : 0, context ? context->last_indirect_target : 0,
+          context ? context->last_indirect_lr : 0);
     }
     return false;
   }

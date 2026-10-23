@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -27,6 +28,7 @@
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
 
@@ -543,6 +545,32 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    static std::atomic<uint32_t> unhandled_fault_count{0};
+    const uint32_t fault_index =
+        unhandled_fault_count.fetch_add(1, std::memory_order_relaxed);
+    if (fault_index < 32) {
+      auto* thread_state = rex::runtime::ThreadState::Get();
+      auto* context = thread_state ? thread_state->context() : nullptr;
+      if (context) {
+        REXSYS_ERROR(
+            "Unhandled guest AV context #{} tid={:08X} last_indirect={:08X} "
+            "last_indirect_lr={:08X} lr={:016X} ctr={:016X} "
+            "r0-r13={:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            fault_index, thread_state->thread_id(), context->last_indirect_target,
+            context->last_indirect_lr, context->lr, context->ctr.u64,
+            context->r0.u32, context->r1.u32,
+            context->r2.u32, context->r3.u32, context->r4.u32, context->r5.u32,
+            context->r6.u32, context->r7.u32, context->r8.u32, context->r9.u32,
+            context->r10.u32, context->r11.u32, context->r12.u32, context->r13.u32);
+        REXSYS_ERROR(
+            "Unhandled guest AV context #{} r14-r31={:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            fault_index, context->r14.u32, context->r15.u32, context->r16.u32,
+            context->r17.u32, context->r18.u32, context->r19.u32, context->r20.u32,
+            context->r21.u32, context->r22.u32, context->r23.u32, context->r24.u32,
+            context->r25.u32, context->r26.u32, context->r27.u32, context->r28.u32,
+            context->r29.u32, context->r30.u32, context->r31.u32);
+      }
+    }
     REXSYS_ERROR(
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),

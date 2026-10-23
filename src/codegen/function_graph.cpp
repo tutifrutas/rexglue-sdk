@@ -534,7 +534,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           REXCODEGEN_WARN("Unable to decode instruction {:X} at {:X}", *data, blockBase);
       } else {
         // Late jump table detection for bctr
-        if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
+        if (insn.opcode->id == PPC_INST_BCTR && !activeJt &&
+            !ctx.config.knownIndirectCallHints.contains(static_cast<uint32_t>(blockBase))) {
           bool is_switch_pattern = false;
           constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
           constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
@@ -637,32 +638,68 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "}}\n");
   }
 
+  auto localRegistersConfig = ctx.config.functions.find(base());
+  if (localRegistersConfig != ctx.config.functions.end() &&
+      localRegistersConfig->second.nonVolatileAsLocal &&
+      (sharesRegisters() || hasExceptionInfo() || !calls().empty() || !tailCalls().empty() ||
+       body.find("REX_CALL_INDIRECT_FUNC(") != std::string::npos)) {
+    REXCODEGEN_ERROR(
+        "Function 0x{:08X} requests non-volatile register localization but is not an audited "
+        "leaf without SEH or indirect calls",
+        base());
+    return {};
+  }
+
   // --- Emit local variable declarations, then body ---
   if (localVariables.ctr)
-    emit_println(out, "\tPPCRegister ctr{{}};");
+    emit_println(out, "\tPPCRegister ctr{{ctx.ctr}};");
   if (localVariables.xer)
-    emit_println(out, "\tPPCXERRegister xer{{}};");
+    emit_println(out, "\tPPCXERRegister xer{{ctx.xer}};");
   if (localVariables.reserved)
-    emit_println(out, "\tPPCRegister reserved{{}};");
+    emit_println(out, "\tPPCRegister reserved{{ctx.reserved}};");
 
   for (size_t i = 0; i < 8; i++) {
     if (localVariables.cr[i])
-      emit_println(out, "\tPPCCRRegister cr{}{{}};", i);
+      emit_println(out, "\tPPCCRRegister cr{}{{ctx.cr{}}};", i, i);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.r[i])
-      emit_println(out, "\tPPCRegister r{}{{}};", i);
+      emit_println(out, "\tPPCRegister r{}{{ctx.r{}}};", i, i);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.f[i])
-      emit_println(out, "\tPPCRegister f{}{{}};", i);
+      emit_println(out, "\tPPCRegister f{}{{ctx.f{}}};", i, i);
   }
 
   for (size_t i = 0; i < 128; i++) {
     if (localVariables.v[i])
-      emit_println(out, "\tPPCVRegister v{}{{}};", i);
+      emit_println(out, "\tPPCVRegister v{}{{ctx.v{}}};", i, i);
+  }
+
+  bool hasRegisterLocals = localVariables.ctr || localVariables.xer || localVariables.reserved;
+  for (bool value : localVariables.cr) hasRegisterLocals |= value;
+  for (bool value : localVariables.r) hasRegisterLocals |= value;
+  for (bool value : localVariables.f) hasRegisterLocals |= value;
+  for (bool value : localVariables.v) hasRegisterLocals |= value;
+  if (hasRegisterLocals) {
+    emit_println(out, "\tauto __rex_sync_registers = [&](int*) {{");
+    if (localVariables.ctr) emit_println(out, "\t\tctx.ctr = ctr;");
+    if (localVariables.xer) emit_println(out, "\t\tctx.xer = xer;");
+    if (localVariables.reserved) emit_println(out, "\t\tctx.reserved = reserved;");
+    for (size_t i = 0; i < 8; ++i)
+      if (localVariables.cr[i]) emit_println(out, "\t\tctx.cr{} = cr{};", i, i);
+    for (size_t i = 0; i < 32; ++i) {
+      if (localVariables.r[i]) emit_println(out, "\t\tctx.r{} = r{};", i, i);
+      if (localVariables.f[i]) emit_println(out, "\t\tctx.f{} = f{};", i, i);
+    }
+    for (size_t i = 0; i < 128; ++i)
+      if (localVariables.v[i]) emit_println(out, "\t\tctx.v{} = v{};", i, i);
+    emit_println(out, "\t}};");
+    emit_println(out,
+                 "\t[[maybe_unused]] std::unique_ptr<int, decltype(__rex_sync_registers)> "
+                 "__rex_register_writeback(reinterpret_cast<int*>(1), __rex_sync_registers);");
   }
 
   if (localVariables.env)
@@ -1249,10 +1286,11 @@ bool FunctionGraph::isMergeableEntryPoint(uint32_t addr) const {
   return node->authority() == FunctionAuthority::GAP_FILL;
 }
 
-TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
+TargetKind FunctionGraph::classifyTarget(uint32_t target, const FunctionNode& caller,
                                          bool isCallInstruction) const {
-  // Find the caller's function
-  const FunctionNode* callerFn = getFunctionContaining(callerAddr);
+  // The emitter owns the caller. Address lookup is ambiguous for overlapping
+  // entrypoints and can select a short secondary routine instead of this body.
+  const FunctionNode* callerFn = &caller;
 
   // Case 1: Target is an import - always a call/tail-call
   if (isImport(target)) {

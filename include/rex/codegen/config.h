@@ -53,6 +53,9 @@ struct FunctionConfig {
   // from a local. Callers sync their localized copies across the call site.
   bool shareRegisters = false;
 
+  // Localize non-volatile registers for an audited leaf function.
+  bool nonVolatileAsLocal = false;
+
   // Get effective size (prefers size over end)
   uint32_t getSize(uint32_t address) const {
     return size ? size : (end > address ? end - address : 0);

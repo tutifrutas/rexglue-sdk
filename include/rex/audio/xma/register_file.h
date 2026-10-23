@@ -2,14 +2,19 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Ported from Xenia Canary e6cd2e4 into ReXGlue, 2026
  */
 
 #pragma once
+
+#include <cstdint>
+#include <string>
+
+
 
 #include <cstdint>
 #include <cstdlib>
@@ -32,7 +37,7 @@ class XmaRegisterFile {
 
   static const XmaRegisterInfo* GetRegisterInfo(uint32_t index);
 
-  static const size_t kRegisterCount = (0xFFFF + 1) / 4;
+  static constexpr size_t kRegisterCount = (0xFFFF + 1) / 4;
   uint32_t values[kRegisterCount];
 
   uint32_t operator[](uint32_t reg) const { return values[reg]; }

@@ -188,6 +188,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
+  ID3D12PipelineState* resolve_copy_fused_rgba8_pipeline_ = nullptr;
 
   // For host render targets.
 

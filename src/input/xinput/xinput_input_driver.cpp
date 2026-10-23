@@ -115,12 +115,12 @@ X_STATUS XinputInputDriver::Setup() {
   }
 
   module_ = module;
-  XInputGetCapabilities_ = xigc;
-  XInputGetState_ = xigs;
-  XInputGetStateEx_ = xigsEx;
-  XInputGetKeystroke_ = xigk;
-  XInputSetState_ = xiss;
-  XInputEnable_ = xie;
+  XInputGetCapabilities_ = reinterpret_cast<void*>(xigc);
+  XInputGetState_ = reinterpret_cast<void*>(xigs);
+  XInputGetStateEx_ = reinterpret_cast<void*>(xigsEx);
+  XInputGetKeystroke_ = reinterpret_cast<void*>(xigk);
+  XInputSetState_ = reinterpret_cast<void*>(xiss);
+  XInputEnable_ = reinterpret_cast<void*>(xie);
 
   return X_STATUS_SUCCESS;
 }
@@ -145,6 +145,7 @@ void XinputInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     DeviceInfo info;
     info.id = DeviceForSlot(slot);
     info.name = "XInput Controller";
+    info.subtype = static_cast<uint8_t>(native_caps.SubType);
     info.synthetic = false;
     out.push_back(info);
   }

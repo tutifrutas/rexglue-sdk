@@ -47,6 +47,10 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+REXCVAR_DEFINE_BOOL(d3d12_fused_resolve, false, "GPU/D3D12",
+                    "Fuse compatible full-surface RGBA8 resolves into sampled textures")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -79,6 +83,7 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_64bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_full_8bpp_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_6_0/resolve_fast_32bpp_1x2xmsaa_fused_cs.h"
 }  // namespace shaders
 
 const D3D12RenderTargetCache::ResolveCopyShaderCode
@@ -284,7 +289,7 @@ bool D3D12RenderTargetCache::Initialize() {
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
   // Create the resolve copying root signature.
-  std::array<D3D12_ROOT_PARAMETER, 3> resolve_copy_root_parameters;
+  std::array<D3D12_ROOT_PARAMETER, 4> resolve_copy_root_parameters;
   // Parameter 0 is constants.
   resolve_copy_root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   resolve_copy_root_parameters[0].Constants.ShaderRegister = 0;
@@ -318,6 +323,18 @@ bool D3D12RenderTargetCache::Initialize() {
   resolve_copy_root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
   resolve_copy_root_parameters[2].DescriptorTable.pDescriptorRanges = &resolve_copy_source_range;
   resolve_copy_root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  // Parameter 3 is the optional native RGBA8 texture output (u1).
+  D3D12_DESCRIPTOR_RANGE resolve_copy_native_dest_range;
+  resolve_copy_native_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  resolve_copy_native_dest_range.NumDescriptors = 1;
+  resolve_copy_native_dest_range.BaseShaderRegister = 1;
+  resolve_copy_native_dest_range.RegisterSpace = 0;
+  resolve_copy_native_dest_range.OffsetInDescriptorsFromTableStart = 0;
+  resolve_copy_root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  resolve_copy_root_parameters[3].DescriptorTable.NumDescriptorRanges = 1;
+  resolve_copy_root_parameters[3].DescriptorTable.pDescriptorRanges =
+      &resolve_copy_native_dest_range;
+  resolve_copy_root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC resolve_copy_root_signature_desc;
   resolve_copy_root_signature_desc.NumParameters = UINT(resolve_copy_root_parameters.size());
   resolve_copy_root_signature_desc.pParameters = resolve_copy_root_parameters.data();
@@ -1029,6 +1046,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   for (size_t i = 0; i < rex::countof(resolve_copy_pipelines_); ++i) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
+  ui::d3d12::util::ReleaseAndNull(resolve_copy_fused_rgba8_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_copy_root_signature_);
 
   ui::d3d12::util::ReleaseAndNull(edram_buffer_descriptor_heap_);
@@ -1194,6 +1212,41 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
+      bool fused_resolve_candidate =
+          REXCVAR_GET(d3d12_fused_resolve) && !draw_resolution_scaled &&
+          GetPath() == Path::kPixelShaderInterlock &&
+          copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA &&
+          !resolve_info.IsCopyingDepth() &&
+          resolve_info.color_edram_info.msaa_samples == xenos::MsaaSamples::k1X &&
+          resolve_info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
+          resolve_info.copy_dest_info.copy_dest_endian == xenos::Endian128::kNone &&
+          !resolve_info.copy_dest_info.copy_dest_array &&
+          !resolve_info.copy_dest_info.copy_dest_slice &&
+          !resolve_info.copy_dest_info.copy_dest_exp_bias &&
+          !resolve_info.copy_dest_info.copy_dest_swap &&
+          !resolve_info.copy_dest_coordinate_info.offset_x_div_8 &&
+          !resolve_info.copy_dest_coordinate_info.offset_y_div_8 &&
+          resolve_info.copy_dest_base == resolve_info.copy_dest_base_original &&
+          resolve_info.copy_dest_extent_start == resolve_info.copy_dest_base_original &&
+          resolve_info.copy_dest_pitch >= resolve_info.coordinate_info.width_div_8 * 8 &&
+          resolve_info.copy_dest_height == resolve_info.height_div_8 * 8;
+      if (fused_resolve_candidate && !resolve_copy_fused_rgba8_pipeline_) {
+        const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+        D3D12_FEATURE_DATA_SHADER_MODEL shader_model = {D3D_SHADER_MODEL_6_0};
+        ID3D12Device* device = provider.GetDevice();
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model,
+                                                 sizeof(shader_model))) &&
+            shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_0) {
+          resolve_copy_fused_rgba8_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+              device, shaders::resolve_fast_32bpp_1x2xmsaa_fused_cs,
+              shaders::resolve_fast_32bpp_1x2xmsaa_fused_cs_size,
+              resolve_copy_root_signature_);
+          if (resolve_copy_fused_rgba8_pipeline_) {
+            resolve_copy_fused_rgba8_pipeline_->SetName(L"Fused RGBA8 resolve");
+          }
+        }
+        fused_resolve_candidate = resolve_copy_fused_rgba8_pipeline_ != nullptr;
+      }
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
@@ -1245,9 +1298,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         // (D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP).
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
         if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+                (bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2) +
+                    uint32_t(fused_resolve_candidate),
+                descriptors)) {
           if (bindless_resources_used_) {
             if (draw_resolution_scaled) {
               descriptor_dest = descriptors[0];
@@ -1276,6 +1331,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                               copy_shader_info.source_bpe_log2);
             }
           }
+          ID3D12Resource* fused_texture = nullptr;
+          ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_fused_texture;
+          if (fused_resolve_candidate) {
+            descriptor_fused_texture = descriptors[bindless_resources_used_ ? 0 : 2];
+            fused_texture = texture_cache.PrepareFusedResolveTexture(
+                resolve_info.copy_dest_base, resolve_info.coordinate_info.width_div_8 * 8,
+                resolve_info.height_div_8 * 8, resolve_info.copy_dest_pitch,
+                xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format),
+                descriptor_fused_texture.first);
+          }
           if (draw_resolution_scaled) {
             texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
                 descriptor_dest.first, copy_shader_info.dest_bpe_log2);
@@ -1290,6 +1355,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+          if (fused_texture) {
+            command_list.D3DSetComputeRootDescriptorTable(3, descriptor_fused_texture.second);
+          }
           if (draw_resolution_scaled) {
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
@@ -1298,7 +1366,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          command_processor_.SetExternalPipeline(
+              fused_texture ? resolve_copy_fused_rgba8_pipeline_
+                            : resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
@@ -1312,6 +1382,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          if (fused_texture && !texture_cache.CompleteFusedResolveTexture(fused_texture)) {
+            REXGPU_WARN("D3D12RenderTargetCache: Fused resolve texture publication failed; "
+                        "the standard texture loader will be used");
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;

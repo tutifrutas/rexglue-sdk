@@ -20,8 +20,12 @@
 namespace rex::filesystem {
 
 NullDevice::NullDevice(const std::string& mount_path,
-                       const std::initializer_list<std::string>& null_paths)
-    : Device(mount_path), null_paths_(null_paths), name_("NullDevice") {}
+                       const std::initializer_list<std::string>& null_paths,
+                       uint32_t sectors_per_allocation_unit)
+    : Device(mount_path),
+      null_paths_(null_paths),
+      name_("NullDevice"),
+      sectors_per_allocation_unit_(sectors_per_allocation_unit) {}
 
 NullDevice::~NullDevice() = default;
 

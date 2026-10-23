@@ -44,6 +44,22 @@ Shader::~Shader() {
   }
 }
 
+bool Shader::Translation::SetTranslatedResult(std::vector<uint8_t> binary,
+                                              std::vector<Error> errors) {
+  translated_binary_ = std::move(binary);
+  errors_ = std::move(errors);
+  host_disassembly_.clear();
+  is_valid_ = !translated_binary_.empty();
+  for (const auto& error : errors_) {
+    if (error.is_fatal) {
+      is_valid_ = false;
+      break;
+    }
+  }
+  is_translated_ = true;
+  return is_valid_;
+}
+
 std::string Shader::Translation::GetTranslatedBinaryString() const {
   std::string result;
   result.resize(translated_binary_.size());

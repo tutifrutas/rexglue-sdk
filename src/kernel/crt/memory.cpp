@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include <rex/hook.h>
+#include <rex/system/xmemory.h>
 
 namespace rex::kernel::crt {
 
@@ -17,16 +18,8 @@ namespace rex::kernel::crt {
 // Standard memory operations
 // ---------------------------------------------------------------------------
 
-static void* native_memcpy(void* dst, const void* src, size_t n) {
-  return std::memcpy(dst, src, n);
-}
-
 static void* native_memmove(void* dst, const void* src, size_t n) {
   return std::memmove(dst, src, n);
-}
-
-static void* native_memset(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
 }
 
 static void* native_memchr(const void* ptr, int val, size_t n) {
@@ -73,9 +66,19 @@ static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t cou
 
 }  // namespace rex::kernel::crt
 
-REX_HOOK(rexcrt_memcpy, rex::kernel::crt::native_memcpy)
+// These two hooks use guest addresses directly so pointer return marshalling
+// cannot lose the physical-heap host offset on Windows. They also preserve the
+// original guest destination in r3, as the PPC routines do.
+REX_HOOK_RAW(rexcrt_memcpy) {
+  auto* dst = rex::memory::GuestPtr<void*>(base, ctx.r3.u32);
+  auto* src = rex::memory::GuestPtr<const void*>(base, ctx.r4.u32);
+  std::memcpy(dst, src, ctx.r5.u32);
+}
 REX_HOOK(rexcrt_memmove, rex::kernel::crt::native_memmove)
-REX_HOOK(rexcrt_memset, rex::kernel::crt::native_memset)
+REX_HOOK_RAW(rexcrt_memset) {
+  auto* dst = rex::memory::GuestPtr<void*>(base, ctx.r3.u32);
+  std::memset(dst, static_cast<int>(ctx.r4.u32), ctx.r5.u32);
+}
 REX_HOOK(rexcrt_memchr, rex::kernel::crt::native_memchr)
 REX_HOOK(rexcrt_XMemCpy, rex::kernel::crt::native_XMemCpy)
 REX_HOOK(rexcrt_XMemSet, rex::kernel::crt::native_XMemSet)

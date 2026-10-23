@@ -500,6 +500,11 @@ struct ResolveInfo {
   // copy_dest_coordinate_info.offset_x/y_div_8 - the origin of the copy
   // destination - is relative to.
   uint32_t copy_dest_base;
+  // Unadjusted base and dimensions from RB_COPY_DEST_PITCH, for validating
+  // whether a resolve fully covers a cached sampled texture.
+  uint32_t copy_dest_base_original;
+  uint32_t copy_dest_pitch;
+  uint32_t copy_dest_height;
   // Memory range that will potentially be modified by copying to the texture.
   // copy_dest_extent_length may be zero if something is wrong with the
   // destination, in this case, clearing may still be done, but copying must be

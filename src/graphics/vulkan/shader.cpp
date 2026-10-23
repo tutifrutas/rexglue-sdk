@@ -10,6 +10,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 
 #include <rex/assert.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -63,6 +64,33 @@ VulkanShader::VulkanShader(const ui::vulkan::VulkanDevice* const vulkan_device,
                   ucode_source_endian),
       vulkan_device_(vulkan_device) {
   assert_not_null(vulkan_device);
+}
+
+void VulkanShader::SetRovBindings(const DxbcShader& dxbc_shader) {
+  std::lock_guard<std::mutex> lock(rov_bindings_mutex_);
+  if (rov_bindings_set_up_) {
+    return;
+  }
+  rov_texture_bindings_.reserve(dxbc_shader.GetTextureBindingsAfterTranslation().size());
+  for (const auto& binding : dxbc_shader.GetTextureBindingsAfterTranslation()) {
+    SpirvShader::TextureBinding& compact = rov_texture_bindings_.emplace_back();
+    std::memset(&compact, 0, sizeof(compact));
+    compact.fetch_constant = binding.fetch_constant;
+    compact.dimension = binding.dimension;
+    compact.is_signed = uint32_t(binding.is_signed);
+  }
+  rov_sampler_bindings_.reserve(dxbc_shader.GetSamplerBindingsAfterTranslation().size());
+  for (const auto& binding : dxbc_shader.GetSamplerBindingsAfterTranslation()) {
+    SpirvShader::SamplerBinding& compact = rov_sampler_bindings_.emplace_back();
+    std::memset(&compact, 0, sizeof(compact));
+    compact.fetch_constant = binding.fetch_constant;
+    compact.mag_filter = binding.mag_filter;
+    compact.min_filter = binding.min_filter;
+    compact.mip_filter = binding.mip_filter;
+    compact.aniso_filter = binding.aniso_filter;
+  }
+  rov_used_texture_mask_ = dxbc_shader.GetUsedTextureMaskAfterTranslation();
+  rov_bindings_set_up_ = true;
 }
 
 Shader::Translation* VulkanShader::CreateTranslationInstance(uint64_t modification) {

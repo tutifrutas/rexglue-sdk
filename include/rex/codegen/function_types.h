@@ -247,6 +247,7 @@ struct JumpTable {
   uint32_t bctrAddress;           // Address of bctr instruction
   uint32_t tableAddress;          // Address of jump table data
   uint8_t indexRegister;          // Register holding switch index
+  uint32_t selectorMask = 0xFFFFFFFF;  // Optional mask applied to the index before dispatch
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 };
 

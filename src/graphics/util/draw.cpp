@@ -947,6 +947,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
   uint32_t copy_dest_extent_start, copy_dest_extent_end;
   auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  info_out.copy_dest_base_original = rb_copy_dest_base;
+  info_out.copy_dest_pitch = rb_copy_dest_pitch.copy_dest_pitch;
+  info_out.copy_dest_height = rb_copy_dest_pitch.copy_dest_height;
   uint32_t copy_dest_pitch_aligned_div_32 =
       (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
       xenos::kTextureTileWidthHeightLog2;

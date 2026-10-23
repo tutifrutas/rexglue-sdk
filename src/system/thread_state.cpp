@@ -33,6 +33,11 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
 
   // Set initial registers
   context_->r1.u64 = stack_base;    // Stack pointer
+  // Match Xenia's Xbox 360 thread contract.  r2 is the platform-reserved
+  // constant register (Xenia initializes it to 0x20000000); leaving it zero
+  // changes the entry environment for titles that inspect it before setting
+  // up their own register state.
+  context_->r2.u64 = 0x20000000;
   context_->r13.u64 = pcr_address;  // PCR address
 
   // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,

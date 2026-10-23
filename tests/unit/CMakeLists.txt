@@ -4,15 +4,19 @@ add_executable(unit_tests
     test_memory.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
+    kernel/wait_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp
+    core/vfs_overwrite_test.cpp
     core/hash_test.cpp
     core/stream_test.cpp
+    core/threading_test.cpp
     core/chrono_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
+    system/repeated_guest_fault_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp

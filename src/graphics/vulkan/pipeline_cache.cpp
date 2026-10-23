@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
+#include <chrono>
+#include <fstream>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -41,7 +44,10 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+#include <rex/graphics/vulkan/rov_shader_abi.h>
+#include <rex/graphics/vulkan/rov_runtime_compiler.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/tessellation_shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -58,6 +64,8 @@ REXCVAR_DEFINE_INT32(
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DECLARE(bool, spirv_disable_rounding_mode_rte);
 
 namespace rex::graphics::vulkan {
 
@@ -179,15 +187,16 @@ void main() {
   return source;
 }
 
+}  // namespace
+
 std::string GetTessellationControlShaderGlsl(Shader::HostVertexShaderType host_vertex_shader_type,
                                              xenos::TessellationMode tessellation_mode,
-                                             uint32_t input_control_points,
                                              uint32_t output_control_points) {
   std::string source;
   source += "#version 450\n";
   source += GetTessellationSystemConstantsBlockGlsl();
   source += "layout(location = 0) in float xe_input_value[];\n";
-  source += "layout(location = 0) patch out vec4 xe_out_patch_control_point_indices;\n";
+  source += "layout(location = 0) out float xe_out_control_point_index[];\n";
   // In GLSL, primitive mode / spacing / winding are TES layout qualifiers.
   // TCS only supports `layout(vertices = N) out`.
   source += fmt::format("layout(vertices = {}) out;\n", output_control_points);
@@ -195,11 +204,6 @@ std::string GetTessellationControlShaderGlsl(Shader::HostVertexShaderType host_v
   source += R"(
 void main() {
   gl_out[gl_InvocationID].gl_Position = vec4(0.0);
-  if (gl_InvocationID != 0u) {
-    return;
-  }
-
-  vec4 patch_control_point_indices = vec4(0.0);
 )";
   if (tessellation_mode == xenos::TessellationMode::kAdaptive) {
     source += R"(
@@ -207,7 +211,8 @@ void main() {
   patch_index &= 0x00FFFFFFu;
   patch_index = max(patch_index, xe_system_cbuffer.xe_vertex_index_min);
   patch_index = min(patch_index, xe_system_cbuffer.xe_vertex_index_max);
-  patch_control_point_indices.x = float(patch_index);
+  xe_out_control_point_index[gl_InvocationID] = float(patch_index);
+  if (gl_InvocationID != 0u) return;
 )";
     if (IsTriangleDomainHostVertexShaderType(host_vertex_shader_type)) {
       source += R"(
@@ -228,21 +233,9 @@ void main() {
 )";
     }
   } else {
-    if (IsPatchIndexedHostVertexShaderType(host_vertex_shader_type)) {
-      source += "  patch_control_point_indices.x = xe_input_value[0];\n";
-    } else {
-      source += "  patch_control_point_indices.x = xe_input_value[0];\n";
-      if (input_control_points >= 2) {
-        source += "  patch_control_point_indices.y = xe_input_value[1];\n";
-      }
-      if (input_control_points >= 3) {
-        source += "  patch_control_point_indices.z = xe_input_value[2];\n";
-      }
-      if (input_control_points >= 4) {
-        source += "  patch_control_point_indices.w = xe_input_value[3];\n";
-      }
-    }
     source += R"(
+  xe_out_control_point_index[gl_InvocationID] = xe_input_value[gl_InvocationID];
+  if (gl_InvocationID != 0u) return;
   float tessellation_factor = xe_system_cbuffer.xe_tessellation_factor_range_max;
 )";
     if (IsTriangleDomainHostVertexShaderType(host_vertex_shader_type)) {
@@ -264,13 +257,10 @@ void main() {
     }
   }
   source += R"(
-  xe_out_patch_control_point_indices = patch_control_point_indices;
 }
 )";
   return source;
 }
-
-}  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
                                          const RegisterFile& register_file,
@@ -287,6 +277,24 @@ VulkanPipelineCache::~VulkanPipelineCache() {
 
 bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& device_properties = vulkan_device->properties();
+  rov_float_controls_.independent_denorm_modes =
+      device_properties.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+  rov_float_controls_.float32_round_to_nearest_even =
+      device_properties.shaderRoundingModeRTEFloat32;
+  rov_float_controls_.float32_flush_to_zero = device_properties.shaderDenormFlushToZeroFloat32;
+  rov_float_controls_.float32_signed_zero_inf_nan_preserve =
+      device_properties.shaderSignedZeroInfNanPreserveFloat32;
+  REXGPU_INFO("Vulkan ROV F32 controls: independent-denorm={}, RTE={}, FTZ={}, "
+              "signed-zero/inf/nan-preserve={}; rounding/denorm policy={}",
+              rov_float_controls_.independent_denorm_modes,
+              rov_float_controls_.float32_round_to_nearest_even,
+              rov_float_controls_.float32_flush_to_zero,
+              rov_float_controls_.float32_signed_zero_inf_nan_preserve,
+              rov_float_controls_.independent_denorm_modes &&
+                      rov_float_controls_.float32_round_to_nearest_even &&
+                      rov_float_controls_.float32_flush_to_zero
+                  ? "explicit RTE+FTZ" : "DXVK driver defaults");
 
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
@@ -297,13 +305,45 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y());
+  rov_dxbc_translator_ = std::make_unique<DxbcShaderTranslator>(
+      static_cast<ui::GraphicsProvider::GpuVendorID>(vulkan_device->properties().vendorID),
+      false, edram_fragment_shader_interlock, false,
+      render_target_cache_.msaa_2x_attachments_supported() ||
+          render_target_cache_.msaa_2x_no_attachments_supported(),
+      render_target_cache_.draw_resolution_scale_x(),
+      render_target_cache_.draw_resolution_scale_y());
 
   if (edram_fragment_shader_interlock) {
-    std::vector<uint8_t> depth_only_fragment_shader_code =
-        shader_translator_->CreateDepthOnlyFragmentShader();
+    const std::vector<uint8_t> depth_only_dxbc =
+        rov_dxbc_translator_->CreateDepthOnlyPixelShader();
+    if (!REXCVAR_GET(dump_shaders).empty()) {
+      const std::filesystem::path dump_root(REXCVAR_GET(dump_shaders));
+      std::error_code dump_error;
+      std::filesystem::create_directories(dump_root, dump_error);
+      if (dump_error) {
+        REXGPU_ERROR("Could not create depth-only ROV dump directory '{}': {}",
+                     dump_root.string(), dump_error.message());
+      } else {
+        const auto path = dump_root / "rov_depth_only.dxbc";
+        std::ofstream output(path, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(depth_only_dxbc.data()),
+                     std::streamsize(depth_only_dxbc.size()));
+        output.close();
+        if (!output) REXGPU_ERROR("Failed writing depth-only ROV DXBC '{}'", path.string());
+      }
+    }
+    const auto depth_only_mapping =
+        MakeRovDescriptorMappings(xenos::ShaderType::kPixel, 0, 0);
+    const RovCompilerResult depth_only_compilation = CompileRovDxbc(
+        depth_only_dxbc.data(), depth_only_dxbc.size(), depth_only_mapping, rov_float_controls_);
+    if (!depth_only_compilation.succeeded) {
+      REXGPU_ERROR("Vulkan ROV depth-only DXBC compilation failed: {}",
+                   depth_only_compilation.diagnostic);
+      return false;
+    }
     depth_only_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
-        vulkan_device, reinterpret_cast<const uint32_t*>(depth_only_fragment_shader_code.data()),
-        depth_only_fragment_shader_code.size());
+        vulkan_device, depth_only_compilation.spirv.data(),
+        depth_only_compilation.spirv.size() * sizeof(uint32_t));
     if (depth_only_fragment_shader_ == VK_NULL_HANDLE) {
       REXGPU_ERROR(
           "VulkanPipelineCache: Failed to create the depth/stencil-only "
@@ -396,6 +436,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     startup_loading_ = false;
   }
 
+  InitializeDriverCache(cache_root);
+
   auto shader_storage_root = cache_root / "shaders";
   auto shader_storage_shareable_root = shader_storage_root / "shareable";
   if (!std::filesystem::exists(shader_storage_shareable_root)) {
@@ -431,8 +473,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   // 'XEPS'.
   const uint32_t pipeline_storage_magic = 0x53504558;
   const uint32_t pipeline_storage_magic_api = edram_fragment_shader_interlock ? 1u : 0u;
+  const uint32_t compiler_identity_hash = uint32_t(
+      XXH3_64bits(rov::kCompilerIdentity, sizeof(rov::kCompilerIdentity)));
   const uint32_t pipeline_storage_version_swapped = rex::byte_swap(
-      std::max(PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion));
+      PipelineDescription::kVersion ^ (rov::kShaderAbiVersion << 24) ^ compiler_identity_hash);
   struct {
     uint32_t magic;
     uint32_t magic_api;
@@ -817,6 +861,7 @@ void VulkanPipelineCache::Shutdown() {
   creation_completion_event_.reset();
 
   ShutdownShaderStorage();
+  SaveAndDestroyDriverCaches();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -876,6 +921,7 @@ void VulkanPipelineCache::Shutdown() {
   texture_binding_layouts_.clear();
 
   // Shut down shader translation.
+  rov_dxbc_translator_.reset();
   shader_translator_.reset();
 }
 
@@ -985,6 +1031,17 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_enable = 0;
     modification.pixel.param_gen_interpolator = 0;
     modification.pixel.param_gen_point = 0;
+  }
+
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
+    uint32_t written_targets = shader.writes_color_targets();
+    modification.pixel.rov_no_blend = uint32_t(written_targets != 0);
+    for (uint32_t i = 0; i < 4 && modification.pixel.rov_no_blend; ++i) {
+      if ((written_targets & (1u << i)) &&
+          (regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF) != 0x00010001) {
+        modification.pixel.rov_no_blend = 0;
+      }
+    }
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -1234,21 +1291,120 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
 
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
+  (void)translator;
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
+  std::lock_guard<std::mutex> translation_lock(rov_translation_mutex_);
 
-  // Perform translation.
-  // If this fails the shader will be marked as invalid and ignored later.
-  if (!translator.TranslateAnalyzedShader(translation)) {
-    REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
+  DxbcShader dxbc_shader(shader.type(), shader.ucode_data_hash(), shader.ucode_dwords(),
+                         shader.ucode_dword_count(), std::endian::native);
+  string::StringBuffer dxbc_disassembly;
+  dxbc_shader.AnalyzeUcode(dxbc_disassembly);
+  const auto legacy_modification = SpirvShaderTranslator::Modification(translation.modification());
+  DxbcShaderTranslator::Modification dxbc_modification;
+  if (shader.type() == xenos::ShaderType::kVertex) {
+    dxbc_modification = DxbcShaderTranslator::Modification(
+        rov_dxbc_translator_->GetDefaultVertexShaderModification(
+            legacy_modification.vertex.dynamic_addressable_register_count,
+            legacy_modification.vertex.host_vertex_shader_type));
+    dxbc_modification.vertex.interpolator_mask = legacy_modification.vertex.interpolator_mask;
+    dxbc_modification.vertex.user_clip_plane_count =
+        legacy_modification.vertex.user_clip_plane_count;
+    dxbc_modification.vertex.user_clip_plane_cull =
+        legacy_modification.vertex.user_clip_plane_cull;
+    dxbc_modification.vertex.vertex_kill_and = legacy_modification.vertex.vertex_kill_and;
+    dxbc_modification.vertex.point_ps_ucp_mode = legacy_modification.vertex.point_ps_ucp_mode;
+    dxbc_modification.vertex.host_vertex_shader_type =
+        legacy_modification.vertex.host_vertex_shader_type;
+    dxbc_modification.vertex.dynamic_addressable_register_count =
+        legacy_modification.vertex.dynamic_addressable_register_count;
+    dxbc_modification.vertex.output_point_size = uint32_t(
+        legacy_modification.vertex.output_point_parameters &&
+        legacy_modification.vertex.host_vertex_shader_type !=
+            Shader::HostVertexShaderType::kPointListAsTriangleStrip);
+  } else {
+    dxbc_modification = DxbcShaderTranslator::Modification(
+        rov_dxbc_translator_->GetDefaultPixelShaderModification(
+            legacy_modification.pixel.dynamic_addressable_register_count));
+    dxbc_modification.pixel.interpolator_mask = legacy_modification.pixel.interpolator_mask;
+    dxbc_modification.pixel.interpolators_centroid =
+        legacy_modification.pixel.interpolators_centroid;
+    dxbc_modification.pixel.param_gen_enable = legacy_modification.pixel.param_gen_enable;
+    dxbc_modification.pixel.param_gen_interpolator =
+        legacy_modification.pixel.param_gen_interpolator;
+    dxbc_modification.pixel.param_gen_point = legacy_modification.pixel.param_gen_point;
+    dxbc_modification.pixel.dynamic_addressable_register_count =
+        legacy_modification.pixel.dynamic_addressable_register_count;
+    dxbc_modification.pixel.depth_stencil_mode =
+        static_cast<DxbcShaderTranslator::Modification::DepthStencilMode>(
+            legacy_modification.pixel.depth_stencil_mode);
+    dxbc_modification.pixel.rov_no_blend = legacy_modification.pixel.rov_no_blend;
+  }
+
+  auto* dxbc_translation = static_cast<DxbcShader::DxbcTranslation*>(
+      dxbc_shader.GetOrCreateTranslation(dxbc_modification.value));
+  if (!dxbc_translation->is_translated() &&
+      !rov_dxbc_translator_->TranslateAnalyzedShader(*dxbc_translation)) {
+    translation.SetTranslatedResult({}, dxbc_translation->errors());
+    REXGPU_ERROR("DXBC generation failed for Vulkan shader {:016X} modification {:016X}",
+                 shader.ucode_data_hash(), translation.modification());
     return false;
   }
-  if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
+  const auto& dxbc_bytes = dxbc_translation->translated_binary();
+  shader.SetRovBindings(dxbc_shader);
+  const auto descriptor_mapping = MakeRovDescriptorMappings(
+      shader.type(), dxbc_shader.GetTextureBindingsAfterTranslation().size(),
+      dxbc_shader.GetSamplerBindingsAfterTranslation().size());
+  const bool dump_enabled = !REXCVAR_GET(dump_shaders).empty();
+  const std::filesystem::path dump_root(REXCVAR_GET(dump_shaders));
+  const std::string dump_stem = fmt::format("rov_{:016X}_{:016X}", shader.ucode_data_hash(),
+                                             translation.modification());
+  if (dump_enabled) {
+    std::error_code dump_error;
+    std::filesystem::create_directories(dump_root, dump_error);
+    if (!dump_error) {
+      std::ofstream dxbc_dump(dump_root / (dump_stem + ".dxbc"), std::ios::binary);
+      dxbc_dump.write(reinterpret_cast<const char*>(dxbc_bytes.data()),
+                      std::streamsize(dxbc_bytes.size()));
+      dxbc_dump.close();
+      if (!dxbc_dump) {
+        REXGPU_ERROR("Failed writing Vulkan ROV DXBC dump '{}'", (dump_root / (dump_stem + ".dxbc")).string());
+      }
+      std::ofstream map_dump(dump_root / (dump_stem + ".map"));
+      map_dump << fmt::format("carrier_modification={:016X}\ndxbc_modification={:016X}\n",
+                              translation.modification(), dxbc_modification.value);
+      for (const auto& mapping : descriptor_mapping) {
+        map_dump << mapping.descriptor_type << ':' << mapping.register_space << ':'
+                 << mapping.register_index << " -> set" << mapping.set
+                 << ",binding" << mapping.binding << '\n';
+      }
+      map_dump.close();
+      if (!map_dump) {
+        REXGPU_ERROR("Failed writing Vulkan ROV descriptor map '{}'", (dump_root / (dump_stem + ".map")).string());
+      }
+    } else {
+      REXGPU_ERROR("Could not create Vulkan shader dump directory '{}': {}",
+                   dump_root.string(), dump_error.message());
+    }
+  }
+  RovCompilerResult compilation =
+      CompileRovDxbc(dxbc_bytes.data(), dxbc_bytes.size(), descriptor_mapping, rov_float_controls_);
+  if (!compilation.succeeded) {
+    Shader::Error error;
+    error.is_fatal = true;
+    error.message = compilation.diagnostic;
+    translation.SetTranslatedResult({}, {std::move(error)});
+    REXGPU_ERROR("DXBC-to-SPIR-V failed for shader {:016X} modification {:016X}: {}",
+                 shader.ucode_data_hash(), translation.modification(), compilation.diagnostic);
+    if (dump_enabled) {
+      std::ofstream map_dump(dump_root / (dump_stem + ".map"), std::ios::app);
+      map_dump << "compiler-diagnostic=" << compilation.diagnostic << '\n';
+      map_dump.close();
+      if (!map_dump) {
+        REXGPU_ERROR("Failed appending Vulkan ROV diagnostic '{}'", (dump_root / (dump_stem + ".map")).string());
+      }
+    }
     return false;
   }
-
-  // TODO(Triang3l): Log that the shader has been successfully translated in
-  // common code.
-
   // Set up the texture binding layout.
   if (shader.EnterBindingLayoutUserUIDSetup()) {
     // Obtain the unique IDs of the binding layout if there are any texture
@@ -1297,6 +1453,21 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
                   "UID is their count");
     shader.SetSamplerBindingLayoutUserUID(shader.GetSamplerBindingsAfterTranslation().size());
   }
+
+  // Publish only after immutable binding metadata and layout IDs are complete.
+  std::vector<uint8_t> spirv_bytes(compilation.spirv.size() * sizeof(uint32_t));
+  std::memcpy(spirv_bytes.data(), compilation.spirv.data(), spirv_bytes.size());
+  if (!translation.SetTranslatedResult(std::move(spirv_bytes))) {
+    REXGPU_ERROR("Invalid DXBC-derived SPIR-V for shader {:016X}", shader.ucode_data_hash());
+    return false;
+  }
+  if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
+    return false;
+  }
+  if (dump_enabled) {
+    translation.Dump(dump_root, "vulkan-rov");
+  }
+
 
   return true;
 }
@@ -1725,7 +1896,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
   std::vector<uint32_t> shader_spirv;
   std::string compile_error;
   std::string source = GetTessellationControlShaderGlsl(
-      host_vertex_shader_type, tessellation_mode, input_control_points, output_control_points);
+      host_vertex_shader_type, tessellation_mode, output_control_points);
   if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, source,
                                              shader_spirv, compile_error)) {
     REXGPU_ERROR(
@@ -1862,7 +2033,8 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   bool denorm_flush_to_zero_float32 = device_properties.shaderDenormFlushToZeroFloat32;
   bool signed_zero_inf_nan_preserve_float32 =
       device_properties.shaderSignedZeroInfNanPreserveFloat32;
-  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32;
+  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32 &&
+                                   !REXCVAR_GET(spirv_disable_rounding_mode_rte);
   if (spirv_version < spv::Spv_1_4) {
     if (denorm_flush_to_zero_float32 || signed_zero_inf_nan_preserve_float32 ||
         rounding_mode_rte_float32) {
@@ -3480,7 +3652,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, GetThreadDriverCache(), 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
@@ -3515,6 +3687,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
 
   return true;
+}
+
+void VulkanPipelineCache::InitializeDriverCache(const std::filesystem::path& cache_root) {
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  if (!driver_cache_path_.empty()) return;
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  VkPhysicalDeviceProperties properties;
+  gpu->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(gpu->physical_device(),
+                                                                   &properties);
+  std::string uuid;
+  for (uint8_t byte : properties.pipelineCacheUUID) uuid += fmt::format("{:02x}", byte);
+  std::error_code error;
+  auto directory = cache_root / "shaders" / "local";
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    REXGPU_WARN("Cannot create Vulkan driver cache directory: {}", error.message());
+    return;
+  }
+  driver_cache_path_ = directory / fmt::format("{:08x}-{:08x}-{:08x}-{}.vkcache",
+      properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+  std::ifstream input(driver_cache_path_, std::ios::binary | std::ios::ate);
+  if (!input) return;
+  const auto size = input.tellg();
+  constexpr std::streamoff kMaxCacheBytes = 128 * 1024 * 1024;
+  if (size < std::streamoff(sizeof(VkPipelineCacheHeaderVersionOne)) || size > kMaxCacheBytes) return;
+  driver_cache_initial_data_.resize(size_t(size));
+  input.seekg(0);
+  if (!input.read(reinterpret_cast<char*>(driver_cache_initial_data_.data()), size)) {
+    driver_cache_initial_data_.clear();
+    return;
+  }
+  VkPipelineCacheHeaderVersionOne header;
+  std::memcpy(&header, driver_cache_initial_data_.data(), sizeof(header));
+  if (header.headerSize < sizeof(header) || header.headerSize > driver_cache_initial_data_.size() ||
+      header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+      header.vendorID != properties.vendorID || header.deviceID != properties.deviceID ||
+      std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE)) {
+    driver_cache_initial_data_.clear();
+    REXGPU_WARN("Ignoring incompatible Vulkan driver cache");
+    return;
+  }
+  REXGPU_INFO("Loaded Vulkan driver cache ({} bytes)", driver_cache_initial_data_.size());
+}
+
+VkPipelineCache VulkanPipelineCache::GetThreadDriverCache() {
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  auto [entry, inserted] = driver_caches_.try_emplace(std::this_thread::get_id(), VK_NULL_HANDLE);
+  if (!inserted) return entry->second;
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  VkPipelineCacheCreateInfo info = {};
+  info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  info.initialDataSize = driver_cache_initial_data_.size();
+  info.pInitialData = driver_cache_initial_data_.data();
+  VkResult result = gpu->functions().vkCreatePipelineCache(gpu->device(), &info, nullptr,
+                                                          &entry->second);
+  if (result != VK_SUCCESS && info.initialDataSize) {
+    info.initialDataSize = 0;
+    info.pInitialData = nullptr;
+    result = gpu->functions().vkCreatePipelineCache(gpu->device(), &info, nullptr, &entry->second);
+  }
+  if (result != VK_SUCCESS) {
+    entry->second = VK_NULL_HANDLE;
+    REXGPU_WARN("Vulkan driver cache unavailable ({}); compiling without it", int(result));
+  }
+  return entry->second;
+}
+
+void VulkanPipelineCache::SaveAndDestroyDriverCaches() {
+  // Called after compiler workers have joined, so no cache is being modified.
+  std::lock_guard<std::mutex> lock(driver_cache_mutex_);
+  const auto* gpu = command_processor_.GetVulkanDevice();
+  const auto& functions = gpu->functions();
+  const VkDevice device = gpu->device();
+  std::vector<VkPipelineCache> caches;
+  for (const auto& [thread, cache] : driver_caches_) {
+    if (cache != VK_NULL_HANDLE) caches.push_back(cache);
+  }
+  if (!caches.empty() && !driver_cache_path_.empty()) {
+    if (caches.size() > 1) {
+      functions.vkMergePipelineCaches(device, caches.front(), uint32_t(caches.size() - 1),
+                                      caches.data() + 1);
+    }
+    size_t size = 0;
+    if (functions.vkGetPipelineCacheData(device, caches.front(), &size, nullptr) == VK_SUCCESS &&
+        size && size <= 128 * 1024 * 1024) {
+      std::vector<uint8_t> data(size);
+      if (functions.vkGetPipelineCacheData(device, caches.front(), &size, data.data()) == VK_SUCCESS) {
+        auto temporary = driver_cache_path_;
+        temporary += "." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                     ".tmp";
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(data.data()), size);
+        output.close();
+        std::error_code error;
+        if (output) std::filesystem::rename(temporary, driver_cache_path_, error);
+        if (!output || error) {
+          REXGPU_WARN("Could not save Vulkan driver cache");
+          std::filesystem::remove(temporary, error);
+        } else {
+          REXGPU_INFO("Saved Vulkan driver cache ({} bytes)", size);
+        }
+      }
+    }
+  }
+  for (VkPipelineCache cache : caches) functions.vkDestroyPipelineCache(device, cache, nullptr);
+  driver_caches_.clear();
+  driver_cache_initial_data_.clear();
+  driver_cache_path_.clear();
 }
 
 void VulkanPipelineCache::CreationThread(size_t thread_index) {

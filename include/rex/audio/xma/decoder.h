@@ -2,28 +2,42 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Ported from Xenia Canary e6cd2e4 into ReXGlue, 2026
  */
 
 #pragma once
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <queue>
+
+#include <rex/audio/xma/helpers.h>
+#include <rex/kernel.h>
+#include <rex/memory.h>
+#include <rex/memory/ring_buffer.h>
+#include <rex/thread.h>
+
+extern "C" {
+#include "libavcodec/avcodec.h"
+}  // extern "C"
+#include <rex/audio/xma/context.h>
+#include <rex/audio/xma/register_file.h>
+#include <rex/bit.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/xthread.h>
+
 
 #include <atomic>
 #include <mutex>
 #include <queue>
 
-#include <rex/audio/xma/context.h>
-#include <rex/audio/xma/register_file.h>
-#include <rex/bit.h>
-#include <rex/kernel.h>
-#include <rex/system/xthread.h>
-
-namespace rex::runtime {
-class FunctionDispatcher;
-}  // namespace rex::runtime
 
 namespace rex::audio {
 
@@ -40,7 +54,9 @@ class XmaDecoder {
   X_STATUS Setup(system::KernelState* kernel_state);
   void Shutdown();
 
-  uint32_t context_array_ptr() const { return register_file_[XmaRegister::ContextArrayAddress]; }
+  uint32_t context_array_ptr() const {
+    return register_file_[XmaRegister::ContextArrayAddress];
+  }
 
   uint32_t AllocateContext();
   void ReleaseContext(uint32_t guest_ptr);
@@ -49,7 +65,7 @@ class XmaDecoder {
   uint32_t ReadRegister(uint32_t addr);
   void WriteRegister(uint32_t addr, uint32_t value);
 
-  bool is_paused() const { return paused_; }
+  bool is_paused() const { return paused_.load(std::memory_order_acquire); }
   void Pause();
   void Resume();
 
@@ -59,11 +75,12 @@ class XmaDecoder {
  private:
   void WorkerThreadMain();
 
-  static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
+  static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as,
+                                        uint32_t addr) {
     return as->ReadRegister(addr);
   }
-  static void MMIOWriteRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr,
-                                     uint32_t value) {
+  static void MMIOWriteRegisterThunk(void* ppc_context, XmaDecoder* as,
+                                     uint32_t addr, uint32_t value) {
     as->WriteRegister(addr, value);
   }
 
@@ -82,7 +99,7 @@ class XmaDecoder {
   XmaRegisterFile register_file_;
 
   static const uint32_t kContextCount = 320;
-  XmaContext contexts_[kContextCount];
+  XmaContext* contexts_[kContextCount];
   bit::BitMap context_bitmap_;
 
   uint32_t context_data_first_ptr_ = 0;

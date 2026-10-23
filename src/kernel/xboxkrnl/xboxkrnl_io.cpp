@@ -455,7 +455,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
 u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
                                mapped_void object_attribs, u32 num_concurrent_threads) {
-  auto completion = new XIOCompletion(REX_KERNEL_STATE());
+  auto completion = object_ref<XIOCompletion>(new XIOCompletion(REX_KERNEL_STATE()));
   if (out_handle) {
     *out_handle = completion->handle();
   }
@@ -488,7 +488,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
   auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
   if (!port) {
-    status = X_STATUS_INVALID_HANDLE;
+    return X_STATUS_INVALID_HANDLE;
   }
 
   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
@@ -684,6 +684,42 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
 
   const uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
   const uint32_t X_IOCTL_DISK_GET_PARTITION_INFO = 0x74004;
+  // Private Xbox storage bootstrap probe sent when opening the optical-image
+  // device.  It has no payload; the title only requires a
+  // successful IOSB and completion event before it proceeds to DINF/DATA I/O.
+  const uint32_t X_IOCTL_IMAGE_MOUNT_PROBE = 0x00024400;
+
+  if (io_control_code == X_IOCTL_IMAGE_MOUNT_PROBE) {
+    auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
+    if (!file) {
+      REXKRNL_IMPORT_FAIL("NtDeviceIoControlFile",
+                          "storage probe handle={:#x} -> invalid handle", handle);
+      return X_STATUS_INVALID_HANDLE;
+    }
+
+    auto iosb = io_status_block
+                    ? REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block)
+                    : nullptr;
+    if (iosb) {
+      iosb->status = X_STATUS_SUCCESS;
+      iosb->information = 0;
+    }
+
+    if (event_handle) {
+      auto event = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+      if (!event) {
+        REXKRNL_IMPORT_FAIL("NtDeviceIoControlFile",
+                            "storage probe event={:#x} -> invalid handle", event_handle);
+        return X_STATUS_INVALID_HANDLE;
+      }
+      event->Set(0, false);
+    }
+
+    REXKRNL_IMPORT_RESULT("NtDeviceIoControlFile",
+                          "storage probe handle={:#x} code={:#x} -> success", handle,
+                          io_control_code);
+    return X_STATUS_SUCCESS;
+  }
 
   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
     if (output_buffer_len < 0x8) {
@@ -692,6 +728,11 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
     }
     memory::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
     memory::store_and_swap<uint32_t>(output_buffer + 4, 512);
+    if (io_status_block) {
+      auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
+      iosb->status = X_STATUS_SUCCESS;
+      iosb->information = 8;
+    }
   } else if (io_control_code == X_IOCTL_DISK_GET_PARTITION_INFO) {
     if (output_buffer_len < 0x10) {
       assert_always();
@@ -699,12 +740,16 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
     }
     memory::store_and_swap<uint64_t>(output_buffer, 0);
     memory::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
+    if (io_status_block) {
+      auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
+      iosb->status = X_STATUS_SUCCESS;
+      iosb->information = 16;
+    }
   } else {
     REXKRNL_DEBUG("NtDeviceIoControlFile(0x{:X}) - unhandled IOCTL!", uint32_t(io_control_code));
     assert_always();
     return X_STATUS_INVALID_PARAMETER;
   }
-
   return X_STATUS_SUCCESS;
 }
 

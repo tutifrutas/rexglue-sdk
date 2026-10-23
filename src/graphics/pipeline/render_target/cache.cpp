@@ -115,11 +115,13 @@ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat for
       break;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
     case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-      // No NaNs on the Xbox 360 GPU, though can't use the extended range with
-      // Direct3D and Vulkan conversions.
-      // TODO(Triang3l): Use the extended-range encoding in all implementations.
-      clamp_rgb_low = clamp_alpha_low = -65504.0f;
-      clamp_rgb_high = clamp_alpha_high = 65504.0f;
+      // No NaNs on the Xbox 360 GPU. The Vulkan interlock path emulates the
+      // extended-range encoding in its pack and unpack, so the whole guest
+      // range survives the clamp.
+      // shortcut: the D3D12 ROV (DXBC) pack still clamps at 65504; port canary
+      // 3ff230d's Float16ExtendedRangeTo32 before re-enabling the D3D12 backend.
+      clamp_rgb_low = clamp_alpha_low = -131008.0f;
+      clamp_rgb_high = clamp_alpha_high = 131008.0f;
       if (!(write_mask & 0b0001)) {
         keep_mask_low |= 0xFFFFu;
       }

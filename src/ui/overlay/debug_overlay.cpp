@@ -27,16 +27,29 @@ DebugOverlayDialog::~DebugOverlayDialog() {}
 void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(360, 340), ImGuiCond_FirstUseEver);
 #else
-  ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(360, 125), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
-  if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+  if (ImGui::Begin("Frame rate##overlay", nullptr,
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
-        ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+        ImGui::Text("FPS: %.1f  Frame: %.2f ms", stats.fps, stats.frame_time_ms);
+      }
+      if (stats.internal_width && stats.internal_height) {
+        ImGui::Text("%s: %u x %u (%ux%u scale)", stats.internal_label, stats.internal_width,
+                    stats.internal_height, stats.render_scale_x, stats.render_scale_y);
+      } else {
+        ImGui::Text("%s: %s", stats.internal_label,
+                    stats.frame_count ? "unavailable" : "waiting for guest frame");
+      }
+      if (stats.output_width && stats.output_height) {
+        ImGui::Text("Output: %u x %u", stats.output_width, stats.output_height);
+      } else {
+        ImGui::TextUnformatted("Output: unavailable");
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS

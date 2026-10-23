@@ -198,6 +198,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       fcfg.name = (*table)["name"].value_or(std::string{});
       fcfg.parent = (*table)["parent"].value_or(0u);
       fcfg.shareRegisters = (*table)["share_registers"].value_or(false);
+      fcfg.nonVolatileAsLocal = (*table)["non_volatile_as_local"].value_or(false);
 
       if (fcfg.size && fcfg.end) {
         REXCODEGEN_ERROR("Function 0x{:08X}: cannot specify both 'size' and 'end'", address);
@@ -264,6 +265,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
 
       auto address_opt = (*table)["address"].value<uint32_t>();
       auto register_opt = (*table)["register"].value<uint32_t>();
+      auto selector_mask_opt = (*table)["selector_mask"].value<uint32_t>();
       auto labels_array = (*table)["labels"].as_array();
 
       if (!address_opt) {
@@ -283,6 +285,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       jt.bctrAddress = *address_opt;
       jt.tableAddress = 0;
       jt.indexRegister = static_cast<uint8_t>(*register_opt);
+      jt.selectorMask = selector_mask_opt.value_or(0xFFFFFFFF);
 
       for (auto& label : *labels_array) {
         if (auto label_val = label.value<int64_t>()) {

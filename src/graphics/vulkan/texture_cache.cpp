@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -3173,6 +3174,15 @@ bool VulkanTextureCache::Initialize() {
 const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
     TextureKey key) const {
   const HostFormatPair& host_format_pair = host_formats_[uint32_t(key.format)];
+  // Diagnostic A/B for the retail startup logo.  Its guest bytes are known
+  // good, so route only this texture through the existing DXT1->RGBA8 path to
+  // distinguish the direct BC1 upload from shader/rasterization problems.
+  if (key.base_page == 0x10BC4 &&
+      std::getenv("TEKKEN6_FORCE_LOGO_DXT1_RGBA") != nullptr &&
+      (key.format == xenos::TextureFormat::k_DXT4_5 ||
+       key.format == xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)) {
+    return kHostFormatDXT4_5Unaligned;
+  }
   if (!host_format_pair.format_unsigned.block_compressed &&
       !host_format_pair.format_signed.block_compressed) {
     return host_format_pair;

@@ -391,6 +391,19 @@ bool D3D12TextureCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT rgba8_uint_support = {};
+  rgba8_uint_support.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  fused_resolve_supported_ =
+      SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &rgba8_uint_support,
+                                            sizeof(rgba8_uint_support))) &&
+      (rgba8_uint_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+  D3D12_FEATURE_DATA_SHADER_MODEL shader_model = {D3D_SHADER_MODEL_6_0};
+  fused_resolve_supported_ =
+      fused_resolve_supported_ &&
+      SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model,
+                                            sizeof(shader_model))) &&
+      shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
+
   if (IsDrawResolutionScaled()) {
     // Buffers not used yet - no need aliasing barriers to change ownership of
     // gigabytes between even and odd buffers.
@@ -695,6 +708,75 @@ void D3D12TextureCache::EndFrame() {
                  unsupported_features & kUnsupportedSnormBit ? " signed" : "");
     unsupported_format_features_used_[i] = 0;
   }
+}
+
+ID3D12Resource* D3D12TextureCache::PrepareFusedResolveTexture(
+    uint32_t base, uint32_t width, uint32_t height, uint32_t pitch,
+    xenos::TextureFormat format, D3D12_CPU_DESCRIPTOR_HANDLE uav_handle) {
+  if (!REXCVAR_GET(d3d12_fused_resolve) || !fused_resolve_supported_ || !base ||
+      (base & 0xFFFu) || (pitch & 31u) || format != xenos::TextureFormat::k_8_8_8_8 ||
+      !width || !height) {
+    return nullptr;
+  }
+
+  D3D12Texture* match = nullptr;
+  uint32_t base_page = (base >> 12) & 0x1FFFFu;
+  uint32_t pitch_blocks = pitch >> 5;
+  for (auto& entry : GetCachedTexturesForBackend()) {
+    const TextureKey& key = entry.first;
+    if (key.base_page != base_page || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.GetWidth() != width || key.GetHeight() != height || key.pitch != pitch_blocks ||
+        key.format != format || key.endianness != xenos::Endian::kNone || !key.tiled ||
+        key.packed_mips || key.mip_max_level || key.depth_or_array_size_minus_1 ||
+        key.signed_separate || key.scaled_resolve) {
+      continue;
+    }
+    if (match) {
+      // Ambiguous cache interpretations remain on the established loader.
+      return nullptr;
+    }
+    match = static_cast<D3D12Texture*>(entry.second.get());
+  }
+  if (!match || match->GetGuestMipsSize()) {
+    return nullptr;
+  }
+
+  D3D12_RESOURCE_DESC resource_desc = match->resource()->GetDesc();
+  if (!(resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+    return nullptr;
+  }
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+  uav_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  command_processor_.GetD3D12Provider().GetDevice()->CreateUnorderedAccessView(
+      match->resource(), nullptr, &uav_desc, uav_handle);
+  command_processor_.PushTransitionBarrier(
+      match->resource(), match->SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  match->MarkAsUsed();
+  return match->resource();
+}
+
+bool D3D12TextureCache::CompleteFusedResolveTexture(ID3D12Resource* resource) {
+  if (!resource) {
+    return false;
+  }
+  for (auto& entry : GetCachedTexturesForBackend()) {
+    D3D12Texture* texture = static_cast<D3D12Texture*>(entry.second.get());
+    if (texture->resource() != resource) {
+      continue;
+    }
+    command_processor_.PushTransitionBarrier(
+        resource, texture->SetResourceState(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    auto global_lock = AcquireGlobalCacheLock();
+    texture->MakeUpToDateAndWatch(global_lock);
+    return true;
+  }
+  return false;
 }
 
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -1543,7 +1625,10 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   // Untiling through a buffer instead of using unordered access because copying
   // is not done that often.
-  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  desc.Flags = REXCVAR_GET(d3d12_fused_resolve) && fused_resolve_supported_ &&
+                       key.format == xenos::TextureFormat::k_8_8_8_8
+                   ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                   : D3D12_RESOURCE_FLAG_NONE;
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.

@@ -31,6 +31,16 @@ void BitStream::SetOffset(size_t offset_bits) {
 size_t BitStream::BitsRemaining() {
   return size_bits_ - offset_bits_;
 }
+bool BitStream::IsOffsetValid(size_t num_bits) {
+  size_t offset_bytes = offset_bits_ >> 3;
+  size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
+
+  if (rel_offset_bits && int32_t(num_bits - 8 - rel_offset_bits) < 0) {
+    return false;
+  }
+  return true;
+}
+
 
 uint64_t BitStream::Peek(size_t num_bits) {
   // FYI: The reason we can't copy more than 57 bits is:

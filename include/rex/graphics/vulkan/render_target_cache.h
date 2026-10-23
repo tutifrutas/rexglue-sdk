@@ -101,6 +101,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   Path GetPath() const override { return path_; }
 
   VkBuffer edram_buffer() const { return edram_buffer_; }
+  // Borrowed storage-texel view of the same EDRAM allocation. Valid until
+  // Shutdown; descriptor consumers must stop using it before cache teardown.
+  VkBufferView edram_rov_buffer_view() const { return edram_rov_buffer_view_; }
 
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
@@ -257,6 +260,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+  VkBufferView edram_rov_buffer_view_ = VK_NULL_HANDLE;
   EdramBufferUsage edram_buffer_usage_;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;

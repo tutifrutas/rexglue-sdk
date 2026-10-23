@@ -75,11 +75,31 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
   }
 
-  if (REXCVAR_GET(vulkan_device) >= 0 &&
-      uint32_t(REXCVAR_GET(vulkan_device)) < physical_devices.size()) {
-    provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
-        provider->vulkan_instance_.get(), physical_devices[REXCVAR_GET(vulkan_device)],
-        with_gpu_emulation, with_presentation);
+  const bool require_fsi = with_gpu_emulation &&
+                           REXCVAR_QUERY(std::string, render_target_path_vulkan) == "fsi";
+  auto create_device = [&](VkPhysicalDevice physical_device) {
+    auto device = VulkanDevice::CreateIfSupported(provider->vulkan_instance_.get(),
+                                                  physical_device, with_gpu_emulation,
+                                                  with_presentation);
+    if (device && require_fsi) {
+      const auto& properties = device->properties();
+      if (!(properties.fragmentShaderSampleInterlock || properties.fragmentShaderPixelInterlock) ||
+          !properties.fragmentStoresAndAtomics || !properties.sampleRateShading ||
+          !properties.standardSampleLocations) {
+        REXLOG_WARN("Vulkan FSI cannot use '{}': required interlock features are unavailable",
+                    properties.deviceName);
+        device.reset();
+      }
+    }
+    return device;
+  };
+  if (REXCVAR_GET(vulkan_device) >= 0) {
+    if (uint32_t(REXCVAR_GET(vulkan_device)) >= physical_devices.size()) {
+      REXLOG_ERROR("Requested Vulkan device {} does not exist", REXCVAR_GET(vulkan_device));
+      return nullptr;
+    }
+    provider->vulkan_device_ = create_device(physical_devices[REXCVAR_GET(vulkan_device)]);
+    if (!provider->vulkan_device_) return nullptr;
   }
 
   if (!provider->vulkan_device_) {
@@ -131,8 +151,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     }
 
     for (const VkPhysicalDevice physical_device : physical_devices_ordered) {
-      provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
-          provider->vulkan_instance_.get(), physical_device, with_gpu_emulation, with_presentation);
+      provider->vulkan_device_ = create_device(physical_device);
       if (provider->vulkan_device_) {
         break;
       }

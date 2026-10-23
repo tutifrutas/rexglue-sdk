@@ -2,22 +2,24 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Ported from Xenia Canary e6cd2e4 into ReXGlue, 2026
  */
 
 #pragma once
 
 #include <atomic>
-#include <queue>
+#include <memory>
+#include <mutex>
+#include <string>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
-#include <rex/system/interfaces/audio.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/interfaces/audio.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/mutex.h>
@@ -25,6 +27,14 @@
 namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
+
+namespace rex::audio {
+class AudioDriver;
+class XmaDecoder;
+}  // namespace rex::audio
+
+#include <atomic>
+
 
 namespace rex::audio {
 
@@ -35,18 +45,30 @@ class XmaDecoder;
 
 class AudioSystem : public system::IAudioSystem {
  public:
+  static constexpr size_t kMaximumQueuedFrames = 64;
+  static constexpr uint32_t kAudioPumpInterval = 5333u;
+  static constexpr uint32_t kAudioIntervalSlack = 400u;
+
   virtual ~AudioSystem();
+
+  virtual std::string name() const = 0;
 
   memory::Memory* memory() const { return memory_; }
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
   XmaDecoder* xma_decoder() const { return xma_decoder_.get(); }
 
-  virtual X_STATUS Setup(system::KernelState* kernel_state);
-  virtual void Shutdown();
+  virtual X_STATUS Setup(system::KernelState* kernel_state) override;
+  void Shutdown() override;
 
-  X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index);
+  X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg,
+                          size_t* out_index);
   void UnregisterClient(size_t index);
-  void SubmitFrame(size_t index, uint32_t samples_ptr);
+  void SubmitFrame(size_t index, float* samples);
+
+  // Creates an independent, non-registered driver instance.
+  virtual AudioDriver* CreateDriver(rex::thread::Semaphore* semaphore,
+                                    uint32_t frequency, uint32_t channels,
+                                    bool need_format_conversion) = 0;
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
@@ -62,36 +84,38 @@ class AudioSystem : public system::IAudioSystem {
 
   void WorkerThreadMain();
 
-  virtual X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
+  virtual X_STATUS CreateDriver(size_t index,
+                                rex::thread::Semaphore* semaphore,
                                 AudioDriver** out_driver) = 0;
-  virtual void DestroyDriver(AudioDriver* driver) = 0;
-
-  static constexpr size_t kMaximumQueuedFrames = 64;
+  X_STATUS CreateClientDriver(size_t index, rex::thread::Semaphore* semaphore,
+                              AudioDriver** out_driver);
+  void DestroyDriver(AudioDriver* driver);
 
   memory::Memory* memory_ = nullptr;
   runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
   std::unique_ptr<XmaDecoder> xma_decoder_;
-  uint32_t queued_frames_;
 
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
 
   rex::thread::global_critical_region global_critical_region_;
-  static const size_t kMaximumClientCount = 8;
+  static constexpr size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
+    uint64_t next_pump_us;
     uint32_t callback;
     uint32_t callback_arg;
     uint32_t wrapped_callback_arg;
     bool in_use;
+    std::mutex lock;
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();
 
-  std::unique_ptr<rex::thread::Semaphore> client_semaphores_[kMaximumClientCount];
+  std::unique_ptr<rex::thread::Semaphore>
+      client_semaphores_[kMaximumClientCount];
   // Event is always there in case we have no clients.
-  std::unique_ptr<rex::thread::Event> shutdown_event_;
-  rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
+  std::unique_ptr<rex::thread::Event> pending_work_event_;
 
   bool paused_ = false;
   rex::thread::Fence pause_fence_;

@@ -35,6 +35,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
+#include <rex/graphics/vulkan/rov_runtime_compiler.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/api.h>
@@ -105,7 +106,7 @@ class VulkanPipelineCache {
     uint32_t ucode_dword_count : 31;
     xenos::ShaderType type : 1;
 
-    static constexpr uint32_t kVersion = 0x20201219;
+    static constexpr uint32_t kVersion = 0x20261022;
   });
 
   enum class PipelineGeometryShader : uint32_t {
@@ -201,7 +202,7 @@ class VulkanPipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20261022;
     PipelineDescription() {
       Reset();
     }
@@ -371,6 +372,16 @@ class VulkanPipelineCache {
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);
 
+  void InitializeDriverCache(const std::filesystem::path& cache_root);
+  VkPipelineCache GetThreadDriverCache();
+  void SaveAndDestroyDriverCaches();
+  // Each compiler thread owns a separate cache: Vulkan cache access requires
+  // external synchronization, and a shared lock would serialize compilation.
+  std::mutex driver_cache_mutex_;
+  std::unordered_map<std::thread::id, VkPipelineCache> driver_caches_;
+  std::vector<uint8_t> driver_cache_initial_data_;
+  std::filesystem::path driver_cache_path_;
+
   VulkanCommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   VulkanRenderTargetCache& render_target_cache_;
@@ -380,6 +391,9 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  RovFloatControls rov_float_controls_;
+  std::unique_ptr<DxbcShaderTranslator> rov_dxbc_translator_;
+  std::mutex rov_translation_mutex_;
 
   struct LayoutUID {
     size_t uid;

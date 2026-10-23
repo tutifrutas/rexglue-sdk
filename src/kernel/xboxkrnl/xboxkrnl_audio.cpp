@@ -32,7 +32,7 @@ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
 u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_u32 out_ptr) {
   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
 
-  rex::thread::Sleep(std::chrono::microseconds(1));
+  rex::thread::MaybeYield();
 
   // Checking these bits to see if any voice volume changed.
   // I think.
@@ -100,7 +100,8 @@ u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samp
 
   auto* audio_system =
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system());
-  audio_system->SubmitFrame(driver_ptr.guest_address() & 0x0000FFFF, samples_ptr.guest_address());
+  auto samples = REX_KERNEL_MEMORY()->TranslateVirtual<float*>(samples_ptr.guest_address());
+  audio_system->SubmitFrame(driver_ptr.guest_address() & 0x0000FFFF, samples);
 
   return X_ERROR_SUCCESS;
 }

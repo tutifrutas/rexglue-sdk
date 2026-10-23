@@ -21,6 +21,13 @@ struct FrameStats {
   double frame_time_ms = 0;
   double fps = 0;
   uint64_t frame_count = 0;
+  uint32_t internal_width = 0;
+  uint32_t internal_height = 0;
+  uint32_t render_scale_x = 0;
+  uint32_t render_scale_y = 0;
+  uint32_t output_width = 0;
+  uint32_t output_height = 0;
+  const char* internal_label = "Internal";
 };
 
 class DebugOverlayDialog : public ImGuiDialog {

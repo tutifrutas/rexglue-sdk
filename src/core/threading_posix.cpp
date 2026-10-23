@@ -13,14 +13,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <ctime>
 #include <deque>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <condition_variable>
+#include <mutex>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -63,6 +67,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #endif
 
 namespace rex::thread {
+
+namespace {
+// Bound the contention path in WaitMultiple.  The all-or-nothing trylock
+// loop is particularly easy to turn into a hot spin when the SDL audio
+// callback releases one of the semaphores being waited on.
+std::mutex g_wait_notify_mutex;
+std::condition_variable g_wait_notify_cv;
+}  // namespace
 
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
@@ -287,9 +299,8 @@ class PosixConditionBase {
   virtual ~PosixConditionBase() = default;
   virtual bool Signal() = 0;
 
-  WaitResult Wait(std::chrono::milliseconds timeout) {
+  WaitResult Wait(std::chrono::milliseconds timeout, PosixConditionBase* to_signal = nullptr) {
     bool executed;
-    auto predicate = [this] { return this->signaled(); };
 #if REX_PLATFORM_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
@@ -302,6 +313,17 @@ class PosixConditionBase {
 #else
     std::unique_lock<std::mutex> lock(mutex_);
 #endif
+    // Reserve event wakeups before releasing the SignalAndWait signal object.
+    WaitRegistration registration(*this);
+    auto predicate = [this, &registration] { return IsWaitSatisfied(registration.waiter); };
+    if (to_signal) {
+      lock.unlock();
+      bool signaled = to_signal->Signal();
+      lock.lock();
+      if (!signaled) {
+        return WaitResult::kFailed;
+      }
+    }
     if (predicate()) {
       executed = true;
     } else {
@@ -313,7 +335,8 @@ class PosixConditionBase {
       }
     }
     if (executed) {
-      post_execution();
+      CompleteWait(registration.waiter);
+      registration.waiter.completed = true;
       return WaitResult::kSuccess;
     } else {
       return WaitResult::kTimeout;
@@ -367,7 +390,8 @@ class PosixConditionBase {
 
       if (!all_locked) {
         locks.clear();
-        std::this_thread::yield();
+        std::unique_lock<std::mutex> notify_lock(g_wait_notify_mutex);
+        g_wait_notify_cv.wait_for(notify_lock, std::chrono::microseconds(200));
         continue;
       }
 
@@ -426,6 +450,24 @@ class PosixConditionBase {
   }
 
  protected:
+  struct Waiter {
+    bool released = false;
+    bool completed = false;
+  };
+  struct WaitRegistration {
+    explicit WaitRegistration(PosixConditionBase& condition) : condition(condition) {
+      condition.BeginWait(waiter);
+    }
+    ~WaitRegistration() { condition.EndWait(waiter); }
+    WaitRegistration(const WaitRegistration&) = delete;
+    WaitRegistration& operator=(const WaitRegistration&) = delete;
+    PosixConditionBase& condition;
+    Waiter waiter;
+  };
+  virtual void BeginWait(Waiter&) {}
+  virtual void EndWait(Waiter&) {}
+  virtual bool IsWaitSatisfied(const Waiter&) const { return signaled(); }
+  virtual void CompleteWait(const Waiter&) { post_execution(); }
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
   std::condition_variable cond_;
@@ -448,8 +490,20 @@ class PosixCondition<Event> : public PosixConditionBase {
 
   bool Signal() override {
     auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = true;
+    // Reserve releases for queued waiters, as Wine does. A newly arriving
+    // waiter must not steal a release before the selected waiter is scheduled.
+    if (manual_reset_) {
+      signal_ = true;
+      for (Waiter* waiter : waiters_) {
+        waiter->released = true;
+      }
+      waiters_.clear();
+    } else {
+      ReleaseOneWaiter();
+    }
+    // notify_one need not select the waiter holding the reserved release.
     cond_.notify_all();
+    g_wait_notify_cv.notify_all();
     return true;
   }
 
@@ -459,12 +513,52 @@ class PosixCondition<Event> : public PosixConditionBase {
   }
 
  private:
+  void ReleaseOneWaiter() {
+    if (!waiters_.empty()) {
+      waiters_.front()->released = true;
+      waiters_.pop_front();
+    } else {
+      signal_ = true;
+    }
+  }
+  void BeginWait(Waiter& waiter) override {
+    if (signal_) {
+      // Claim an existing signal before SignalAndWait unlocks this mutex.
+      waiter.released = true;
+      if (!manual_reset_) {
+        signal_ = false;
+      }
+    } else {
+      waiters_.push_back(&waiter);
+    }
+  }
+  void EndWait(Waiter& waiter) override {
+    auto it = std::find(waiters_.begin(), waiters_.end(), &waiter);
+    if (it != waiters_.end()) {
+      waiters_.erase(it);
+    }
+    if (!manual_reset_ && waiter.released && !waiter.completed) {
+      // A failed signal operation must not consume the wait object's release.
+      ReleaseOneWaiter();
+      cond_.notify_all();
+      g_wait_notify_cv.notify_all();
+    }
+  }
+  bool IsWaitSatisfied(const Waiter& waiter) const override {
+    return waiter.released || signal_;
+  }
+  void CompleteWait(const Waiter& waiter) override {
+    if (!waiter.released) {
+      post_execution();
+    }
+  }
   inline bool signaled() const override { return signal_; }
   inline void post_execution() override {
     if (!manual_reset_) {
       signal_ = false;
     }
   }
+  std::deque<Waiter*> waiters_;
   bool signal_;
   const bool manual_reset_;
 };
@@ -487,6 +581,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    g_wait_notify_cv.notify_all();
     return true;
   }
 
@@ -1188,12 +1283,12 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
   if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
     return WaitResult::kFailed;
   }
+  if (!is_alertable) {
+    return posix_wait_handle_to_wait_on->condition().Wait(
+        timeout, &posix_wait_handle_to_signal->condition());
+  }
   if (!posix_wait_handle_to_signal->condition().Signal()) {
     return WaitResult::kFailed;
-  }
-
-  if (!is_alertable) {
-    return posix_wait_handle_to_wait_on->condition().Wait(timeout);
   }
 
   ScopedAlertableState alertable_state_guard(true);

@@ -37,8 +37,8 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
-                      "Vulkan render target implementation path")
+REXCVAR_DEFINE_STRING(render_target_path_vulkan, "fsi", "GPU/Vulkan",
+                      "Vulkan render target path: fsi (ROV/interlock, default) or fbo")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
@@ -234,7 +234,15 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // shaders, and the usage of fragment shader interlock, prefer the former
     // for simplicity.
     if (!fsi_path_supported) {
-      path_ = Path::kHostRenderTargets;
+      REXGPU_ERROR(
+          "Vulkan FSI was requested but is unsupported on '{}': sample_interlock={} "
+          "pixel_interlock={} fragment_atomics={} sample_shading={} standard_samples={} "
+          "storage_buffers={} required={}. Select a compatible GPU/driver.",
+          device_properties.deviceName, device_properties.fragmentShaderSampleInterlock,
+          device_properties.fragmentShaderPixelInterlock, device_properties.fragmentStoresAndAtomics,
+          device_properties.sampleRateShading, device_properties.standardSampleLocations,
+          device_properties.maxPerStageDescriptorStorageBuffers, shared_memory_binding_count + 1);
+      return false;
     }
   }
 
@@ -473,20 +481,42 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           vulkan_device, 256, 1, &descriptor_set_layout_size,
           descriptor_set_layout_sampled_image_x2_);
 
-  // EDRAM contents reinterpretation buffer.
-  // 90 MB with 9x resolution scaling - within the minimum
-  // maxStorageBufferRange.
+  // EDRAM backing shared by the existing compute/resolve SSBO and the ROV
+  // shader's R32_UINT storage-texel view.
+  VkFormatProperties edram_texel_format_properties{};
+  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_R32_UINT,
+                                          &edram_texel_format_properties);
+  if (!(edram_texel_format_properties.bufferFeatures &
+        VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
+    REXGPU_ERROR("Vulkan device '{}' lacks R32_UINT storage-texel-buffer support required by EDRAM ROV",
+                 device_properties.deviceName);
+    Shutdown();
+    return false;
+  }
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device,
           VkDeviceSize(xenos::kEdramSizeBytes *
                        (draw_resolution_scale_x() * draw_resolution_scale_y())),
           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
           ui::vulkan::util::MemoryPurpose::kDeviceLocal, edram_buffer_, edram_buffer_memory_)) {
     REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the EDRAM buffer");
     Shutdown();
     return false;
   }
+  const VkBufferViewCreateInfo edram_rov_buffer_view_create_info = {
+      VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, nullptr, 0, edram_buffer_, VK_FORMAT_R32_UINT,
+      0, VK_WHOLE_SIZE};
+  if (dfn.vkCreateBufferView(device, &edram_rov_buffer_view_create_info, nullptr,
+                             &edram_rov_buffer_view_) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the R32_UINT EDRAM ROV buffer view");
+    Shutdown();
+    return false;
+  }
+  vulkan_device->SetObjectName(VK_OBJECT_TYPE_BUFFER_VIEW, edram_rov_buffer_view_,
+                               "EDRAM R32_UINT ROV storage texel view");
+  REXGPU_INFO("VulkanRenderTargetCache: EDRAM ROV view created (R32_UINT, {} bytes)",
+              xenos::kEdramSizeBytes * draw_resolution_scale_x() * draw_resolution_scale_y());
   if (GetPath() == Path::kPixelShaderInterlock) {
     // The first operation will likely be drawing.
     edram_buffer_usage_ = EdramBufferUsage::kFragmentReadWrite;
@@ -965,6 +995,9 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
               sizeof(last_update_framebuffer_attachments_));
   last_update_framebuffer_ = VK_NULL_HANDLE;
 
+  REXGPU_INFO("Vulkan render target path: {} on '{}'",
+              path_ == Path::kPixelShaderInterlock ? "FSI" : "host framebuffers",
+              device_properties.deviceName);
   InitializeCommon();
   return true;
 }
@@ -1072,6 +1105,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          edram_storage_buffer_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
+                                         edram_rov_buffer_view_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, edram_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, edram_buffer_memory_);
 

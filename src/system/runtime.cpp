@@ -113,6 +113,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   thread::EnableAffinityConfiguration();
 
   tool_mode_ = config.tool_mode;
+  null_device_sectors_per_allocation_unit_ =
+      config.null_device_sectors_per_allocation_unit;
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -344,7 +346,9 @@ bool Runtime::SetupVfs() {
   // go to NullDevice (VFS resolves devices in registration order)
   auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"), std::string("\\Cache1")};
   auto null_device =
-      std::make_unique<rex::filesystem::NullDevice>("\\Device\\Harddisk0", null_paths);
+      std::make_unique<rex::filesystem::NullDevice>(
+          "\\Device\\Harddisk0", null_paths,
+          null_device_sectors_per_allocation_unit_);
   if (null_device->Initialize()) {
     file_system_->RegisterDevice(std::move(null_device));
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");

@@ -181,6 +181,7 @@ class XObject {
     (void)stream;
     return false;
   }
+
   static object_ref<XObject> Restore(KernelState* kernel_state, Type type,
                                      stream::ByteStream* stream);
 

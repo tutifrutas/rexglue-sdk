@@ -1774,9 +1774,12 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       REXCODEGEN_TRACE(
           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} < funcStart=0x{:08X}", bctrAddr,
           i, target, funcStart);
-      if (jt.targets.empty())
-        return std::nullopt;
-      break;
+      // A table that begins with in-function targets and then reaches an
+      // earlier function cannot be safely represented as a local switch.
+      // Keeping the prefix would silently turn the remaining valid selectors
+      // into a generated default trap. Let bctr use the computed CTR target
+      // unless the table can be modeled in full.
+      return std::nullopt;
     }
 
     // Validate target points to valid code, not null padding
@@ -1815,7 +1818,8 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
 BlockDiscoveryResult discoverBlocks(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables,
+    const std::unordered_set<uint32_t>* knownIndirectCalls) {
   BlockDiscoveryResult result;
   std::unordered_set<uint32_t> visited;
   std::unordered_set<uint32_t> blockStarts;
@@ -1934,7 +1938,7 @@ BlockDiscoveryResult discoverBlocks(
                   jt->targets.size());
             }
           }
-          if (!jt) {
+          if (!jt && (!knownIndirectCalls || !knownIndirectCalls->contains(addr))) {
             jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);
           }
           if (jt) {

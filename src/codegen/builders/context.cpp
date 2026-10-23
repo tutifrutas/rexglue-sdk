@@ -45,7 +45,11 @@ const FunctionGraph& BuilderContext::graph() const {
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  auto it = config().functions.find(fn.base());
+  bool requested = config().nonVolatileRegistersAsLocalVariables ||
+                   (it != config().functions.end() && it->second.nonVolatileAsLocal);
+  return requested && !fn.sharesRegisters() && !fn.hasExceptionInfo() && fn.calls().empty() &&
+         fn.tailCalls().empty();
 }
 
 std::string BuilderContext::r(size_t index) {
@@ -202,7 +206,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // function's: the helper bodies are emitted under it too, so once they
       // spill to locals they are no-ops that scribble zeros on the caller's
       // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
+      if (localizeNonVolatiles() &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         // print nothing - these are handled by local variable tracking
         return;
@@ -281,7 +285,7 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  auto kind = graph().classifyTarget(target, fn, false);
 
   switch (kind) {
     case TargetKind::InternalLabel:
